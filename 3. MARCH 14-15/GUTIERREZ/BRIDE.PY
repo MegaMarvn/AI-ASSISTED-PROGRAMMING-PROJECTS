@@ -20,7 +20,7 @@
 
 import tkinter as tk
 import tkinter.font as tkfont
-import tkinter.filedialog as fd
+import tkinter.filedialog as fds
 import math, json, threading, datetime, os
 from tkinter import messagebox, ttk
 

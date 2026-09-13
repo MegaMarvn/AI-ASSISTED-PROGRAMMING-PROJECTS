@@ -1,0 +1,386 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>2-Storey House — Structural 3D Viewer</title>
+<style>
+  :root{
+    --bg:#0e1116; --bg2:#12161d; --panel:#161b23; --panel2:#1b212b;
+    --line:#28303c; --line2:#333d4b;
+    --ink:#d7dee8; --muted:#8b96a5; --faint:#5c6674;
+    --accent:#4cc2ff; --accent-dim:#2a6f92;
+    --concrete:#9aa2ac; --steel:#5aa0e0; --slab:#c2cad3; --soil:#c99a5b;
+    --mono:ui-monospace,"SF Mono",Menlo,Consolas,"Liberation Mono",monospace;
+    --sans:"Inter",system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%;background:var(--bg);color:var(--ink);font-family:var(--sans);overflow:hidden}
+  #app{position:fixed;inset:0}
+  canvas{display:block;touch-action:none}
+
+  /* ---- control panel ---- */
+  .panel{
+    position:absolute;top:16px;left:16px;width:248px;max-height:calc(100% - 32px);
+    background:linear-gradient(180deg,var(--panel),var(--bg2));
+    border:1px solid var(--line);border-radius:12px;
+    box-shadow:0 18px 50px -20px #000, 0 1px 0 #ffffff08 inset;
+    display:flex;flex-direction:column;overflow:hidden;backdrop-filter:blur(6px);
+  }
+  .panel header{padding:16px 16px 13px;border-bottom:1px solid var(--line)}
+  .panel h1{margin:0;font-size:15px;font-weight:600;letter-spacing:.2px}
+  .panel .sub{margin:3px 0 0;font-size:12px;color:var(--muted);line-height:1.45}
+  .scroll{overflow:auto;padding:6px 10px 12px}
+  .scroll::-webkit-scrollbar{width:8px}
+  .scroll::-webkit-scrollbar-thumb{background:var(--line2);border-radius:8px}
+
+  .group{margin-top:10px}
+  .group > .lbl{font-size:11px;color:var(--faint);padding:6px 6px 4px;font-weight:600}
+  .row{
+    display:flex;align-items:center;gap:10px;padding:7px 8px;border-radius:8px;cursor:pointer;
+    user-select:none;transition:background .12s ease;
+  }
+  .row:hover{background:var(--panel2)}
+  .row:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
+  .row input{position:absolute;opacity:0;width:0;height:0}
+  .box{
+    width:16px;height:16px;border-radius:5px;border:1.5px solid var(--line2);
+    flex:0 0 auto;display:grid;place-items:center;transition:all .12s ease;background:#0c0f14;
+  }
+  .row input:checked + .box{background:var(--accent);border-color:var(--accent)}
+  .box svg{width:11px;height:11px;stroke:#04121b;stroke-width:3.2;fill:none;opacity:0;transition:opacity .1s}
+  .row input:checked + .box svg{opacity:1}
+  .row .name{font-size:13px;flex:1}
+  .swatch{width:11px;height:11px;border-radius:3px;flex:0 0 auto;border:1px solid #ffffff22}
+
+  .btns{display:flex;gap:8px;padding:10px}
+  .btn{
+    flex:1;appearance:none;border:1px solid var(--line2);background:var(--panel2);color:var(--ink);
+    font:inherit;font-size:12.5px;padding:9px 10px;border-radius:8px;cursor:pointer;transition:all .12s;
+  }
+  .btn:hover{border-color:var(--accent-dim);color:#fff}
+  .btn:active{transform:translateY(1px)}
+  .btn:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
+
+  /* ---- data readout ---- */
+  .readout{
+    position:absolute;right:16px;top:16px;background:linear-gradient(180deg,var(--panel),var(--bg2));
+    border:1px solid var(--line);border-radius:12px;padding:13px 15px;min-width:180px;
+    box-shadow:0 18px 50px -20px #000;
+  }
+  .readout h2{margin:0 0 9px;font-size:12px;font-weight:600;color:var(--muted)}
+  .kv{display:flex;justify-content:space-between;gap:16px;font-size:12px;padding:3px 0}
+  .kv .k{color:var(--faint)}
+  .kv .v{font-family:var(--mono);color:var(--ink)}
+  .hint{
+    position:absolute;left:50%;bottom:14px;transform:translateX(-50%);
+    font-size:12px;color:var(--muted);background:#0c0f14cc;border:1px solid var(--line);
+    padding:6px 12px;border-radius:20px;white-space:nowrap;
+  }
+  @media (max-width:720px){
+    .readout{display:none}
+    .panel{width:210px}
+    .hint{display:none}
+  }
+</style>
+</head>
+<body>
+<div id="app"></div>
+
+<aside class="panel" aria-label="Model layers and view controls">
+  <header>
+    <h1>2-Storey Residence</h1>
+    <p class="sub">RC frame · steel king-post roof truss · elastic-mat soil springs. Drag to orbit, scroll to zoom.</p>
+  </header>
+  <div class="scroll">
+    <div class="group" id="layers"></div>
+    <div class="group">
+      <div class="lbl">View</div>
+      <label class="row" tabindex="0"><input type="checkbox" id="tglRotate"><span class="box"><svg viewBox="0 0 12 12"><path d="M2 6l3 3 5-6"/></svg></span><span class="name">Auto-rotate</span></label>
+      <label class="row" tabindex="0"><input type="checkbox" id="tglXray"><span class="box"><svg viewBox="0 0 12 12"><path d="M2 6l3 3 5-6"/></svg></span><span class="name">X-ray / wireframe</span></label>
+    </div>
+    <div class="btns">
+      <button class="btn" id="btnReset">Reset view</button>
+      <button class="btn" id="btnFit">Frame model</button>
+    </div>
+  </div>
+</aside>
+
+<div class="readout" aria-hidden="true">
+  <h2>Model data</h2>
+  <div class="kv"><span class="k">Storeys</span><span class="v">2</span></div>
+  <div class="kv"><span class="k">Footprint</span><span class="v">12 × 10 m</span></div>
+  <div class="kv"><span class="k">Floor area</span><span class="v">120 m²</span></div>
+  <div class="kv"><span class="k">Storey ht</span><span class="v">3.00 m</span></div>
+  <div class="kv"><span class="k">Ridge</span><span class="v">+7.67 m</span></div>
+  <div class="kv"><span class="k">Columns</span><span class="v">400×400</span></div>
+  <div class="kv"><span class="k">Beams</span><span class="v">300×500</span></div>
+  <div class="kv"><span class="k">SBC</span><span class="v">150 kPa</span></div>
+</div>
+
+<div class="hint">Left-drag orbit · right-drag / two-finger pan · scroll pinch zoom</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script>
+(function(){
+  "use strict";
+  const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+  // ---------- scene ----------
+  const app = document.getElementById("app");
+  const scene = new THREE.Scene();
+  scene.background = new THREE.Color(0x0e1116);
+  scene.fog = new THREE.Fog(0x0e1116, 42, 95);
+
+  const renderer = new THREE.WebGLRenderer({antialias:true});
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+  renderer.shadowMap.enabled = true;
+  renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+  app.appendChild(renderer.domElement);
+
+  const camera = new THREE.PerspectiveCamera(45, 1, 0.1, 500);
+
+  // ---------- lights ----------
+  scene.add(new THREE.HemisphereLight(0xbcd0e6, 0x2a2f38, 0.85));
+  const key = new THREE.DirectionalLight(0xffffff, 1.05);
+  key.position.set(16, 26, 12);
+  key.castShadow = true;
+  key.shadow.mapSize.set(2048, 2048);
+  const d = 20;
+  key.shadow.camera.left=-d; key.shadow.camera.right=d;
+  key.shadow.camera.top=d; key.shadow.camera.bottom=-d;
+  key.shadow.camera.near=1; key.shadow.camera.far=80;
+  key.shadow.bias=-0.0003;
+  scene.add(key);
+  const fill = new THREE.DirectionalLight(0x6f86a8, 0.35);
+  fill.position.set(-18, 10, -14); scene.add(fill);
+
+  // ---------- ground ----------
+  const groundMat = new THREE.MeshStandardMaterial({color:0x11151b, roughness:1, metalness:0});
+  const ground = new THREE.Mesh(new THREE.PlaneGeometry(200,200), groundMat);
+  ground.rotation.x = -Math.PI/2; ground.position.y = -0.6; ground.receiveShadow = true;
+  scene.add(ground);
+  const grid = new THREE.GridHelper(60, 60, 0x2b333f, 0x1b212a);
+  grid.position.y = -0.59; scene.add(grid);
+
+  // ---------- materials ----------
+  const M = {
+    concrete: new THREE.MeshStandardMaterial({color:0x9aa2ac, roughness:0.92, metalness:0.02}),
+    grade:    new THREE.MeshStandardMaterial({color:0x828b96, roughness:0.95, metalness:0.02}),
+    slab:     new THREE.MeshStandardMaterial({color:0xc2cad3, roughness:0.9,  metalness:0.02, transparent:true, opacity:0.9}),
+    steel:    new THREE.MeshStandardMaterial({color:0x5aa0e0, roughness:0.4,  metalness:0.65}),
+    footing:  new THREE.MeshStandardMaterial({color:0x6a7581, roughness:0.98, metalness:0.02}),
+    roof:     new THREE.MeshStandardMaterial({color:0x8b95a2, roughness:0.55, metalness:0.35, transparent:true, opacity:0.42, side:THREE.DoubleSide}),
+    wall:     new THREE.MeshStandardMaterial({color:0xdfe6ee, roughness:0.9,  metalness:0.0,  transparent:true, opacity:0.14, side:THREE.DoubleSide}),
+    soil:     new THREE.MeshStandardMaterial({color:0xc99a5b, roughness:0.9,  metalness:0.1}),
+  };
+  const allMats = Object.values(M);
+
+  // ---------- geometry helpers ----------
+  const UP = new THREE.Vector3(0,1,0);
+  function member(p1, p2, sx, sz, mat){
+    const a=new THREE.Vector3(...p1), b=new THREE.Vector3(...p2);
+    const dir=new THREE.Vector3().subVectors(b,a); const len=dir.length();
+    const geo=new THREE.BoxGeometry(sx, len, sz);
+    const m=new THREE.Mesh(geo, mat); m.castShadow=true; m.receiveShadow=true;
+    m.position.copy(a).addScaledVector(dir,0.5);
+    m.quaternion.setFromUnitVectors(UP, dir.clone().normalize());
+    return m;
+  }
+  function box(cx,cy,cz, sx,sy,sz, mat){
+    const m=new THREE.Mesh(new THREE.BoxGeometry(sx,sy,sz), mat);
+    m.position.set(cx,cy,cz); m.castShadow=true; m.receiveShadow=true; return m;
+  }
+  function quad(a,b,c,dd, mat){
+    const g=new THREE.BufferGeometry();
+    g.setAttribute("position", new THREE.BufferAttribute(new Float32Array([...a,...b,...c, ...a,...c,...dd]),3));
+    g.computeVertexNormals();
+    const m=new THREE.Mesh(g,mat); m.castShadow=true; m.receiveShadow=true; return m;
+  }
+  function tri(a,b,c, mat){
+    const g=new THREE.BufferGeometry();
+    g.setAttribute("position", new THREE.BufferAttribute(new Float32Array([...a,...b,...c]),3));
+    g.computeVertexNormals();
+    return new THREE.Mesh(g,mat);
+  }
+
+  // ---------- model grid ----------
+  const X=[0,4,8,12], Z=[0,5,10], Y=[0,3,6];
+  const APEXY = 6 + 1.6667, APEXZ = 5;
+  const root = new THREE.Group();
+  const L = {};                                   // named layer groups
+  function layer(n){ const g=new THREE.Group(); L[n]=g; root.add(g); return g; }
+  const gFoot=layer("Footings"), gGrade=layer("Grade beams"), gCol=layer("Columns"),
+        gBeam=layer("Beams"), gSlab=layer("2nd-floor slab"), gTruss=layer("Roof truss"),
+        gRoof=layer("Roof cladding"), gWall=layer("Walls");
+
+  // footings
+  X.forEach(x=>Z.forEach(z=> gFoot.add(box(x,-0.18,z, 1.0,0.36,1.0, M.footing)) ));
+
+  // grade beams (y≈0.3)
+  const gy=0.3;
+  Z.forEach(z=>{ for(let i=0;i<3;i++) gGrade.add(member([X[i],gy,z],[X[i+1],gy,z],0.3,0.5,M.grade)); });
+  X.forEach(x=>{ for(let j=0;j<2;j++) gGrade.add(member([x,gy,Z[j]],[x,gy,Z[j+1]],0.5,0.3,M.grade)); });
+
+  // columns
+  X.forEach(x=>Z.forEach(z=>{
+    gCol.add(member([x,0,z],[x,3,z],0.4,0.4,M.concrete));
+    gCol.add(member([x,3,z],[x,6,z],0.4,0.4,M.concrete));
+  }));
+
+  // beams at floor & roof levels (dropped so tops sit at the level)
+  [3,6].forEach(y=>{
+    const by=y-0.25;
+    Z.forEach(z=>{ for(let i=0;i<3;i++) gBeam.add(member([X[i],by,z],[X[i+1],by,z],0.3,0.5,M.concrete)); });
+    X.forEach(x=>{ for(let j=0;j<2;j++) gBeam.add(member([x,by,Z[j]],[x,by,Z[j+1]],0.5,0.3,M.concrete)); });
+  });
+
+  // 2nd-floor slab
+  gSlab.add(box(6, 3-0.075, 5, 12, 0.15, 10, M.slab));
+
+  // steel roof truss (king-post per X gridline) + ridge + braces
+  const apex = X.map(x=>[x,APEXY,APEXZ]);
+  X.forEach((x,i)=>{
+    const A=[x,6,0], Mn=[x,6,5], B=[x,6,10], P=apex[i];
+    gTruss.add(member(A,P,0.12,0.12,M.steel));
+    gTruss.add(member(P,B,0.12,0.12,M.steel));
+    gTruss.add(member(Mn,P,0.12,0.12,M.steel));
+  });
+  for(let i=0;i<3;i++) gTruss.add(member(apex[i],apex[i+1],0.12,0.12,M.steel));  // ridge
+  gTruss.add(member(apex[0],[X[1],6,5],0.1,0.1,M.steel));                        // sway braces
+  gTruss.add(member(apex[3],[X[2],6,5],0.1,0.1,M.steel));
+
+  // roof cladding (two slopes + gable triangles)
+  gRoof.add(quad([0,6,0],[12,6,0],[12,APEXY,5],[0,APEXY,5], M.roof));
+  gRoof.add(quad([0,APEXY,5],[12,APEXY,5],[12,6,10],[0,6,10], M.roof));
+
+  // walls (translucent perimeter) + gable ends
+  gWall.add(quad([0,0,0],[12,0,0],[12,6,0],[0,6,0], M.wall));       // front
+  gWall.add(quad([0,0,10],[12,0,10],[12,6,10],[0,6,10], M.wall));   // back
+  gWall.add(quad([0,0,0],[0,0,10],[0,6,10],[0,6,0], M.wall));       // left
+  gWall.add(quad([12,0,0],[12,0,10],[12,6,10],[12,6,0], M.wall));   // right
+  gWall.add(tri([0,6,0],[0,6,10],[0,APEXY,5], M.wall));             // gable x=0
+  gWall.add(tri([12,6,0],[12,6,10],[12,APEXY,5], M.wall));          // gable x=12
+
+  root.position.set(-6,0,-5);   // center footprint on origin
+  scene.add(root);
+
+  // ---------- layer UI ----------
+  const swatches = {
+    "Footings":"#6a7581","Grade beams":"#828b96","Columns":"#9aa2ac","Beams":"#9aa2ac",
+    "2nd-floor slab":"#c2cad3","Roof truss":"#5aa0e0","Roof cladding":"#8b95a2","Walls":"#dfe6ee"
+  };
+  const defaultOff = {};   // all on by default
+  const layersEl = document.getElementById("layers");
+  layersEl.innerHTML = '<div class="lbl">Layers</div>';
+  Object.keys(L).forEach(name=>{
+    const on = !defaultOff[name];
+    L[name].visible = on;
+    const row=document.createElement("label");
+    row.className="row"; row.tabIndex=0;
+    row.innerHTML =
+      `<input type="checkbox" ${on?"checked":""}>`+
+      `<span class="box"><svg viewBox="0 0 12 12"><path d="M2 6l3 3 5-6"/></svg></span>`+
+      `<span class="swatch" style="background:${swatches[name]}"></span>`+
+      `<span class="name">${name}</span>`;
+    const cb=row.querySelector("input");
+    const flip=()=>{ L[name].visible=cb.checked; };
+    cb.addEventListener("change", flip);
+    row.addEventListener("keydown", e=>{ if(e.key===" "||e.key==="Enter"){e.preventDefault(); cb.checked=!cb.checked; flip();}});
+    layersEl.appendChild(row);
+  });
+
+  // ---------- orbit controls (self-contained) ----------
+  const target = new THREE.Vector3(0, 2.6, 0);
+  const state = { r: 34, theta: 0.9, phi: 1.02 };   // spherical
+  const HOME = {...state};
+  function applyCam(){
+    const sp=Math.sin(state.phi), cp=Math.cos(state.phi);
+    camera.position.set(
+      target.x + state.r*sp*Math.sin(state.theta),
+      target.y + state.r*cp,
+      target.z + state.r*sp*Math.cos(state.theta)
+    );
+    camera.lookAt(target);
+  }
+  let drag=null, lastX=0, lastY=0;
+  const el=renderer.domElement;
+  el.addEventListener("pointerdown",e=>{
+    el.setPointerCapture(e.pointerId);
+    drag = (e.button===2 || e.shiftKey) ? "pan" : "rot"; lastX=e.clientX; lastY=e.clientY;
+    autoRotate=false; document.getElementById("tglRotate").checked=false;
+  });
+  el.addEventListener("contextmenu",e=>e.preventDefault());
+  window.addEventListener("pointermove",e=>{
+    if(!drag) return;
+    const dx=e.clientX-lastX, dy=e.clientY-lastY; lastX=e.clientX; lastY=e.clientY;
+    if(drag==="rot"){
+      state.theta -= dx*0.005;
+      state.phi = Math.max(0.12, Math.min(Math.PI/2+0.05, state.phi - dy*0.005));
+    } else {
+      const panScale = state.r*0.0016;
+      const right=new THREE.Vector3().setFromMatrixColumn(camera.matrix,0);
+      const up=new THREE.Vector3().setFromMatrixColumn(camera.matrix,1);
+      target.addScaledVector(right, -dx*panScale);
+      target.addScaledVector(up,     dy*panScale);
+    }
+    applyCam();
+  });
+  window.addEventListener("pointerup",()=>{ drag=null; });
+  el.addEventListener("wheel",e=>{
+    e.preventDefault();
+    state.r = Math.max(9, Math.min(80, state.r * (1 + Math.sign(e.deltaY)*0.09)));
+    applyCam();
+  }, {passive:false});
+  // touch pinch
+  let pinch=0;
+  el.addEventListener("touchmove",e=>{
+    if(e.touches.length===2){
+      const dxx=e.touches[0].clientX-e.touches[1].clientX, dyy=e.touches[0].clientY-e.touches[1].clientY;
+      const dist=Math.hypot(dxx,dyy);
+      if(pinch){ state.r=Math.max(9,Math.min(80, state.r*(pinch/dist))); applyCam(); }
+      pinch=dist;
+    }
+  },{passive:true});
+  el.addEventListener("touchend",()=>pinch=0);
+
+  // ---------- view buttons ----------
+  let autoRotate=false;
+  document.getElementById("tglRotate").addEventListener("change",e=>autoRotate=e.target.checked);
+  document.getElementById("tglXray").addEventListener("change",e=>{
+    const on=e.target.checked;
+    allMats.forEach(m=>{
+      if(m===M.wall||m===M.roof||m===M.slab) return;
+      m.wireframe=on; m.transparent = on || m.userData._t; m.opacity = on?0.5:1;
+    });
+  });
+  M.slab.userData._t=M.wall.userData._t=M.roof.userData._t=true;
+  function tweenHome(){
+    if(reduceMotion){ Object.assign(state,HOME); target.set(0,2.6,0); applyCam(); return; }
+    const s0={...state}, t0=target.clone(), t1=new THREE.Vector3(0,2.6,0); let k=0;
+    (function step(){
+      k=Math.min(1,k+0.06); const e=1-Math.pow(1-k,3);
+      state.r=s0.r+(HOME.r-s0.r)*e; state.theta=s0.theta+(HOME.theta-s0.theta)*e; state.phi=s0.phi+(HOME.phi-s0.phi)*e;
+      target.lerpVectors(t0,t1,e); applyCam();
+      if(k<1) requestAnimationFrame(step);
+    })();
+  }
+  document.getElementById("btnReset").addEventListener("click",tweenHome);
+  document.getElementById("btnFit").addEventListener("click",tweenHome);
+
+  // ---------- resize / loop ----------
+  function resize(){
+    const w=app.clientWidth, h=app.clientHeight;
+    renderer.setSize(w,h); camera.aspect=w/h; camera.updateProjectionMatrix();
+  }
+  window.addEventListener("resize",resize); resize(); applyCam();
+
+  (function loop(){
+    if(autoRotate){ state.theta+=0.0032; applyCam(); }
+    renderer.render(scene,camera);
+    requestAnimationFrame(loop);
+  })();
+})();
+</script>
+</body>
+</html>

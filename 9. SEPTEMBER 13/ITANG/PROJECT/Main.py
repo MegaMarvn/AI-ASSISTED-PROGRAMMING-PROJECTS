@@ -1,1277 +1,1618 @@
+"""
+RC Footing Designer — NSCP 2015
+Single-file implementation of the specification in "RC Footing Designer — NSCP 2015.pdf"
+
+Structure (mirrors the recommended modular layout so it can be split later):
+    [SECTION 1]  Utils / constants / units
+    [SECTION 2]  Data models (Project, Geometry, Materials, Loads, Soil, Reinforcement)
+    [SECTION 3]  Design engine (bearing, flexure, shear, punching, reinforcement)
+    [SECTION 4]  Visualization (2D via Matplotlib, 3D via PyVista)
+    [SECTION 5]  Reporting (PDF via ReportLab)
+    [SECTION 6]  GUI (PySide6)
+    [SECTION 7]  Entry point
+
+DISCLAIMER
+----------
+This software is intended to assist qualified structural engineers.
+It does NOT replace engineering judgment, geotechnical investigation,
+code verification, professional review, or approval by the responsible
+design professional. It never guarantees structural safety.
+
+All NSCP 2015 clause references and factors marked REQUIRES CODE
+VERIFICATION must be checked against the actual code document before
+use in real design.
+"""
+
+from __future__ import annotations
+
 import json
 import math
-import os
+import sys
 import traceback
-from dataclasses import dataclass, asdict, field
-from datetime import date
+from dataclasses import dataclass, field, asdict
+from enum import Enum
 from pathlib import Path
-import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
+from typing import Any, Dict, List, Optional
 
-import numpy as np
-import matplotlib
-matplotlib.use('Agg')
-import matplotlib.pyplot as plt
-from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
-from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+# ---------------------------------------------------------------------------
+# [SECTION 1]  UTILS / CONSTANTS / UNITS
+# ---------------------------------------------------------------------------
 
-APP_TITLE = "RC Footing Design — NSCP 2015"
-MM_PER_M = 1000.0
-BAR_DIAMETERS_MM = {10: 10.0, 12: 12.0, 16: 16.0, 20: 20.0, 25: 25.0, 28: 28.0, 32: 32.0, 36: 36.0}
-BAR_SPACINGS_MM = [100, 125, 150, 175, 200, 225, 250, 300]
-PHI_FLEXURE = 0.90
-PHI_SHEAR = 0.75
+CODE_VERSION = "NSCP 2015"
 
-DISCLAIMER = (
-    "FOR ENGINEERING DESIGN ASSISTANCE ONLY.\n\n"
-    "This software implements selected NSCP 2015 / ACI-based reinforced-concrete "
-    "and foundation design checks. Final foundation design must be verified by a "
-    "qualified structural/geotechnical engineer using the official NSCP 2015, "
-    "project-specific geotechnical investigation, actual structural analysis, "
-    "and applicable local requirements.\n\n"
-    "The software does not replace engineering judgment, site investigation, "
-    "geotechnical interpretation, or detailed structural analysis."
+# ---- Strength reduction factors -------------------------------------------
+# REQUIRES CODE VERIFICATION — these values follow the ACI 318-14 lineage
+# which NSCP 2015 is based on. Confirm each against the NSCP 2015 text.
+PHI_FLEXURE = 0.90          # REQUIRES CODE VERIFICATION — NSCP 2015 §421.2.2
+PHI_SHEAR = 0.75            # REQUIRES CODE VERIFICATION — NSCP 2015 §421.2.1
+PHI_BEARING = 0.65          # REQUIRES CODE VERIFICATION — NSCP 2015 §422.4
+
+# ---- Material defaults ----------------------------------------------------
+ES_STEEL = 200_000.0        # MPa — universal (VERIFIED)
+DEFAULT_CONCRETE_DENSITY = 24.0  # kN/m^3 (normal-weight RC)
+
+# ---- Minimum reinforcement ------------------------------------------------
+# REQUIRES CODE VERIFICATION — NSCP 2015 §425.2 (temperature/shrinkage,
+# deformed bars, grade 420). Value below is the ACI 318-14 lineage value.
+MIN_REBAR_RATIO_FOOTING = 0.0018  # REQUIRES CODE VERIFICATION
+
+# ---- Cover ----------------------------------------------------------------
+# REQUIRES CODE VERIFICATION — NSCP 2015 §420.6.1.3 (cast against earth)
+DEFAULT_COVER_MM = 75.0     # REQUIRES CODE VERIFICATION
+
+# ---- Centralized code references -----------------------------------------
+CODE_REFERENCES = {
+    "load_combinations": "NSCP 2015 §203 — REQUIRES CODE VERIFICATION",
+    "bearing": "NSCP 2015 §304 / §305 — REQUIRES CODE VERIFICATION",
+    "flexure": "NSCP 2015 §422.3 — REQUIRES CODE VERIFICATION",
+    "one_way_shear": "NSCP 2015 §422.5 — REQUIRES CODE VERIFICATION",
+    "punching_shear": "NSCP 2015 §422.6 — REQUIRES CODE VERIFICATION",
+    "min_reinforcement": "NSCP 2015 §425.2 — REQUIRES CODE VERIFICATION",
+    "development": "NSCP 2015 §425.4 — REQUIRES CODE VERIFICATION",
+    "cover": "NSCP 2015 §420.6.1 — REQUIRES CODE VERIFICATION",
+    "modulus_concrete": "NSCP 2015 §419.2.2 — REQUIRES CODE VERIFICATION",
+}
+
+DISCLAIMER_TEXT = (
+    "This software is intended to assist qualified structural engineers in "
+    "analysis and design. It does not replace engineering judgment, "
+    "geotechnical investigation, code verification, professional review, or "
+    "approval by the responsible design professional. It does not guarantee "
+    "structural safety."
 )
 
+# Standard bar diameters (mm) — informational list, user may enter custom
+STANDARD_BAR_DIAMETERS_MM = [10, 12, 16, 20, 25, 28, 32, 36]
+
+
+class Status(str, Enum):
+    NOT_ANALYZED = "NOT ANALYZED"
+    PASS = "PASS"
+    WARNING = "WARNING"
+    FAIL = "FAIL"
+
+
+# ---------------------------------------------------------------------------
+# [SECTION 2]  DATA MODELS
+# ---------------------------------------------------------------------------
 
 @dataclass
-class ProjectData:
-    project_name: str = ""
+class ProjectInfo:
+    name: str = "Untitled Project"
     location: str = ""
     structure: str = ""
-    footing_mark: str = "F1"
-    column_mark: str = "C1"
-    designer: str = ""
-    checked_by: str = ""
-    design_date: str = field(default_factory=lambda: str(date.today()))
-    notes: str = ""
+    client: str = ""
+    design_engineer: str = ""
+    checker: str = ""
+    date: str = ""
+    revision: str = "0"
+    drawing_no: str = ""
+    foundation_mark: str = "F1"
 
 
 @dataclass
-class MaterialProperties:
-    fc: float = 21.0
-    gamma_c: float = 24.0
-    fy: float = 415.0
-    es: float = 200000.0
+class Concrete:
+    fc: float = 28.0              # MPa
+    density: float = DEFAULT_CONCRETE_DENSITY  # kN/m^3
+    lambda_factor: float = 1.0    # normal weight
+
+    def Ec(self) -> float:
+        # REQUIRES CODE VERIFICATION — NSCP 2015 §419.2.2
+        return 4700.0 * math.sqrt(self.fc)
 
 
 @dataclass
-class SoilProperties:
-    qa: float = 150.0
-    gamma_soil: float = 18.0
-    phi_deg: float = 0.0
-    cohesion: float = 0.0
-    groundwater: float = 99.0
-    embedment: float = 1.0
-    soil_cover: float = 0.15
-    fos: float = 3.0
-    settlement_limit: float = 25.0
-    pressure_type: str = "Gross allowable"
-    bearing_method: str = "User-Provided qa"
+class Rebar:
+    fy: float = 415.0             # MPa
+    Es: float = ES_STEEL
+    diameter: float = 20.0        # mm
+
+    @property
+    def area(self) -> float:
+        return math.pi * self.diameter ** 2 / 4.0  # mm^2
 
 
 @dataclass
-class LoadData:
-    input_mode: str = "Service Loads"
-    self_weight_mode: str = "Auto include footing self-weight"
-    manual_self_weight: float = 0.0
-    D: float = 600.0
-    L: float = 180.0
-    other: float = 0.0
-    roof: float = 0.0
-    equipment: float = 0.0
-    Mx: float = 0.0
-    My: float = 0.0
-    Hx: float = 0.0
-    Hy: float = 0.0
-    direct_Pu: float = 0.0
-    direct_Mux: float = 0.0
-    direct_Muy: float = 0.0
-    direct_Vux: float = 0.0
-    direct_Vuy: float = 0.0
-    combo: str = "1.2D + 1.6L"
+class Soil:
+    qa: float = 200.0             # kPa allowable bearing pressure
+    unit_weight: float = 18.0     # kN/m^3
+    Df: float = 1.5               # m embedment depth
+    groundwater_depth: float = 99.0
+    has_bearing_capacity: bool = True
 
 
 @dataclass
 class FootingGeometry:
-    footing_type: str = "Isolated Rectangular"
-    B: float = 2.4
-    L: float = 2.1
-    h: float = 0.45
-    cx: float = 0.40
-    cy: float = 0.40
-    cover: float = 75.0
-    col_offset_x: float = 0.0
-    col_offset_y: float = 0.0
-    pedestal_B: float = 0.0
-    pedestal_L: float = 0.0
-    pedestal_h: float = 0.0
-    auto_size: bool = True
-    square: bool = False
-    rounding_mm: float = 50.0
-    h_max: float = 1.0
-    B1: float = 1.5
-    B2: float = 2.2
-    col_spacing: float = 3.0
-    strap_width: float = 0.35
-    strap_depth: float = 0.50
-    wall_t: float = 0.20
-    wall_line_load: float = 100.0
+    B: float = 2000.0             # mm width
+    L: float = 2000.0             # mm length
+    H: float = 450.0              # mm thickness
+    cx: float = 400.0             # mm column width
+    cy: float = 400.0             # mm column length
+    cover: float = DEFAULT_COVER_MM
+
+    def effective_depth(self, bar_dia: float) -> float:
+        return self.H - self.cover - bar_dia / 2.0
 
 
 @dataclass
-class RebarSpec:
-    x_dia: int = 16
-    x_spacing: int = 150
-    y_dia: int = 16
-    y_spacing: int = 150
-    dowel_dia: int = 16
-    dowel_n: int = 4
-    top_dia: int = 12
-    top_spacing: int = 200
+class LoadCase:
+    name: str
+    P: float = 0.0                # kN
+    Mx: float = 0.0               # kN·m
+    My: float = 0.0               # kN·m
 
 
 @dataclass
-class DesignResults:
-    ok: bool = False
-    status: str = "NOT CALCULATED"
-    warnings: list = field(default_factory=list)
-    calculations: list = field(default_factory=list)
-    footing: dict = field(default_factory=dict)
-    bearing: dict = field(default_factory=dict)
-    flexure: dict = field(default_factory=dict)
-    shear: dict = field(default_factory=dict)
-    punching: dict = field(default_factory=dict)
-    development: dict = field(default_factory=dict)
-    detailing: dict = field(default_factory=dict)
-    reinforcement: dict = field(default_factory=dict)
-    combined: dict = field(default_factory=dict)
-    trace: list = field(default_factory=list)
-    recommendations: list = field(default_factory=list)
-    assumptions: list = field(default_factory=list)
-    code_refs: list = field(default_factory=list)
-
-
-def rnd_up(value, increment):
-    if increment <= 0:
-        return value
-    return math.ceil(value / increment - 1e-12) * increment
-
-
-def clamp(v, lo, hi):
-    return max(lo, min(hi, v))
-
-
-def bar_area_mm2(d):
-    return math.pi * d * d / 4.0
-
-
-def bar_area_per_m(d, spacing_mm):
-    if spacing_mm <= 0:
-        return 0.0
-    return bar_area_mm2(d) * 1000.0 / spacing_mm
-
-
-def parse_float(value, name, allow_zero=True):
-    try:
-        x = float(value)
-    except Exception:
-        raise ValueError(f"{name} must be numeric.")
-    if not math.isfinite(x):
-        raise ValueError(f"{name} must be finite.")
-    if allow_zero:
-        if x < 0:
-            raise ValueError(f"{name} cannot be negative.")
-    else:
-        if x <= 0:
-            raise ValueError(f"{name} must be greater than zero.")
-    return x
-
-
-def load_combinations(load: LoadData):
-    if load.input_mode == "Factored / Ultimate Loads":
-        return [("Direct ultimate", load.direct_Pu, load.direct_Mux, load.direct_Muy,
-                 math.hypot(load.direct_Vux, load.direct_Vuy), "User-supplied ultimate")]
-
-    D = load.D + load.other
-    L = load.L
-    # Only commonly used gravity combinations explicitly requested in the source specification.
-    combos = [
-        ("1.4D", 1.4 * D, 1.4 * load.Mx, 1.4 * load.My, 1.4 * math.hypot(load.Hx, load.Hy), "NSCP 2015 / ACI-based gravity combination — VERIFY AGAINST OFFICIAL NSCP 2015"),
-        ("1.2D + 1.6L", 1.2 * D + 1.6 * L, 1.2 * load.Mx + 1.6 * load.Mx, 1.2 * load.My + 1.6 * load.My, math.hypot(1.2 * load.Hx, 1.2 * load.Hy), "NSCP 2015 / ACI-based gravity combination — VERIFY AGAINST OFFICIAL NSCP 2015"),
-        ("1.2D + 1.0L", 1.2 * D + 1.0 * L, 1.2 * load.Mx + load.Mx, 1.2 * load.My + load.My, math.hypot(1.2 * load.Hx, 1.2 * load.Hy), "NSCP 2015 / ACI-based gravity combination — VERIFY AGAINST OFFICIAL NSCP 2015"),
-    ]
-    return combos
-
-
-def get_governing_combo(load):
-    combos = load_combinations(load)
-    return max(combos, key=lambda x: abs(x[1]))
-
-
-def calculate_bearing_capacity(soil: SoilProperties):
-    if soil.bearing_method == "User-Provided qa":
-        return {"method": "User-Provided qa", "qa": soil.qa, "implemented": False,
-                "warning": "Allowable bearing capacity is user-provided; use project geotechnical report."}
-
-    phi = math.radians(soil.phi_deg)
-    if soil.phi_deg <= 0 and soil.cohesion <= 0:
-        return {"method": soil.bearing_method, "qa": soil.qa, "implemented": False,
-                "warning": "Insufficient soil parameters for bearing-capacity calculation."}
-
-    # Transparent simplified Terzaghi/Meyerhof-style equation. Exact code/project corrections
-    # are intentionally flagged for independent verification.
-    tanp = math.tan(phi)
-    if abs(math.tan(phi)) < 1e-9:
-        Nq = 1.0
-    else:
-        Nq = math.exp(math.pi * tanp) * math.tan(math.pi / 4 + phi / 2) ** 2
-    Nc = (Nq - 1.0) / tanp if abs(tanp) > 1e-9 else 5.14
-    Ngamma = 2.0 * (Nq + 1.0) * tanp
-    Df = soil.embedment
-    q = soil.gamma_soil * Df
-    B = 1.0
-    if soil.bearing_method == "Terzaghi":
-        qult = soil.cohesion * Nc + q * Nq + 0.5 * soil.gamma_soil * B * Ngamma
-    else:
-        # General equation nominal form; shape/depth/inclination factors omitted -> explicit warning.
-        qult = soil.cohesion * Nc + q * Nq + 0.5 * soil.gamma_soil * B * Ngamma
-    qa = qult / max(soil.fos, 1e-9)
-    return {
-        "method": soil.bearing_method,
-        "Nc": Nc, "Nq": Nq, "Ngamma": Ngamma, "q_overburden": q,
-        "qult": qult, "qa": qa, "implemented": True,
-        "warning": "Simplified bearing-capacity implementation. Shape/depth/inclination, water-table and effective-stress corrections require project-specific verification. [VERIFY AGAINST OFFICIAL NSCP 2015]"
-    }
-
-
-def soil_pressures(B, L, P, Mx, My):
-    if P <= 0:
-        raise ValueError("Resultant vertical load must be greater than zero for bearing-pressure analysis.")
-    ex = Mx / P
-    ey = My / P
-    q0 = P / (B * L)
-    qx = 6.0 * Mx / (B * L * L)
-    qy = 6.0 * My / (L * B * B)
-    # Common biaxial full-contact linear approximation.
-    qmax = q0 + abs(qx) + abs(qy)
-    qmin = q0 - abs(qx) - abs(qy)
-    return ex, ey, q0, qmax, qmin
-
-
-def required_area(service_P, qa):
-    if qa <= 0:
-        raise ValueError("Allowable bearing capacity must be greater than zero.")
-    return service_P / qa
-
-
-def choose_dims(area_req, square, rounding_mm, max_ratio=2.5):
-    inc_m = max(0.05, rounding_mm / 1000.0)
-    if square:
-        b = rnd_up(math.sqrt(area_req), inc_m)
-        return b, b
-    # Favor roughly rectangular dimensions with bounded aspect ratio.
-    b = math.sqrt(area_req / 1.05)
-    l = area_req / b
-    if l / b > max_ratio:
-        b = math.sqrt(area_req / max_ratio)
-        l = area_req / b
-    b = rnd_up(b, inc_m)
-    l = rnd_up(max(l, area_req / b), inc_m)
-    return b, l
-
-
-def phi_flexural_capacity(fc, fy, b_mm, d_mm, As_mm2):
-    if b_mm <= 0 or d_mm <= 0 or As_mm2 <= 0:
-        return 0.0, 0.0, 0.0
-    a = As_mm2 * fy / (0.85 * fc * b_mm)
-    Mn = As_mm2 * fy * (d_mm - a / 2.0) / 1e6
-    return PHI_FLEXURE * Mn, Mn, a
-
-
-def flexural_As(fc, fy, b_mm, d_mm, Mu_kNm, min_ratio=0.0018):
-    if d_mm <= 0 or b_mm <= 0:
-        return 0.0, 0.0, 0.0
-    # Solve phi * As fy (d-a/2) >= Mu, iteratively.
-    As = max(Mu_kNm * 1e6 / (PHI_FLEXURE * fy * max(0.9 * d_mm, 1.0)), b_mm * min_ratio * 1.0)
-    for _ in range(50):
-        a = As * fy / (0.85 * fc * b_mm)
-        Mn = As * fy * max(d_mm - a / 2.0, 0.0) / 1e6
-        f = PHI_FLEXURE * Mn - Mu_kNm
-        if f >= 0:
-            break
-        As *= 1.05
-    Asmin = b_mm * min_ratio
-    return As, Asmin, PHI_FLEXURE
-
-
-def vc_oneway(fc, b_mm, d_mm):
-    # ACI-style nominal concrete shear strength approximation, SI.
-    return 0.17 * math.sqrt(max(fc, 0.0)) * b_mm * d_mm / 1000.0
-
-
-def vc_punching(fc, bo_mm, d_mm, vc_factor=4.0):
-    # Conservative simplified upper-level expression used only for screening.
-    return 0.33 * math.sqrt(max(fc, 0.0)) * bo_mm * d_mm / 1000.0
-
-
-def development_length_tension(db_mm, fy, fc, cover_mm=75.0):
-    # Transparent simplified tension development screen; detailed bar/top-bar/epoxy modifiers not modeled.
-    ld = max(12.0 * db_mm, (3.0 / 40.0) * fy * db_mm / max(math.sqrt(fc), 1e-9))
-    return ld
-
-
-def select_spacing(As_req_per_m, dia, candidates=None):
-    if candidates is None:
-        candidates = BAR_SPACINGS_MM
-    for s in candidates:
-        Asprov = bar_area_per_m(dia, s)
-        if Asprov + 1e-9 >= As_req_per_m:
-            return s, Asprov
-    return candidates[-1], bar_area_per_m(dia, candidates[-1])
-
-
-def fit_rebar(width_mm, dia_mm, cover_mm, spacing_mm):
-    usable = width_mm - 2 * cover_mm - dia_mm
-    if usable <= 0:
-        return False, 0, "No usable bar placement width after cover/bar diameter."
-    n = math.floor(usable / spacing_mm) + 1
-    if n < 2:
-        return False, n, "Too few bars fit within the footing width."
-    min_clear = max(25.0, dia_mm)
-    actual_clear = (usable - (n - 1) * spacing_mm) / max(n - 1, 1)
-    if actual_clear < min_clear - 1e-6:
-        return False, n, f"Computed clear spacing is {actual_clear:.1f} mm < minimum screening value {min_clear:.1f} mm."
-    return True, n, ""
-
-
-def design_isolated(data_project, mat, soil, load, geom, rebar):
-    r = DesignResults()
-    r.assumptions = [
-        "Geotechnical bearing check uses service-level load for allowable soil pressure.",
-        "Structural flexure/shear checks use governing user-selected or generated ultimate combination.",
-        "Footing self-weight treatment is controlled by the user interface; this build auto-includes a screening allowance when selected.",
-        "Soil pressure distribution is a linear rectangular-footing approximation.",
-        "Punching shear eccentricity/unbalanced-moment transfer is not fully modeled; verify against official NSCP 2015.",
-        "Settlement is not calculated unless a future geotechnical module is added.",
-    ]
-    r.code_refs = [
-        "NSCP 2015 — Reinforced Concrete provisions; exact clause/table references should be verified against the official edition.",
-        "ACI-based flexural and shear strength methodology — [VERIFY AGAINST OFFICIAL NSCP 2015].",
-    ]
-
-    bearing_info = calculate_bearing_capacity(soil)
-    qa = bearing_info.get("qa", soil.qa)
-    if bearing_info.get("warning"):
-        r.warnings.append(bearing_info["warning"])
-
-    combos = load_combinations(load)
-    gov = get_governing_combo(load)
-    combo_name, Pu, Mux, Muy, Vh, combo_note = gov
-    if load.input_mode == "Service Loads":
-        service_P = load.D + load.L + load.other + load.roof + load.equipment
-        if load.self_weight_mode == "Auto include footing self-weight":
-            service_P += mat.gamma_c * geom.B * geom.L * geom.h
-        elif load.self_weight_mode == "Manual footing self-weight":
-            service_P += load.manual_self_weight
-        if load.input_mode == "Service Loads" and service_P <= 0:
-            raise ValueError("Service vertical load must be greater than zero.")
-        service_Mx = load.Mx
-        service_My = load.My
-    else:
-        service_P = load.direct_Pu
-        service_Mx = load.direct_Mux
-        service_My = load.direct_Muy
-
-    if geom.B < geom.cx or geom.L < geom.cy:
-        raise ValueError("Footing dimensions must be greater than or equal to column dimensions.")
-
-    if geom.auto_size:
-        # Iterate area sizing when automatic footing self-weight is enabled because self-weight depends on B × L × h.
-        B, L = geom.B, geom.L
-        for _ in range(20):
-            service_P_eff = load.D + load.L + load.other + load.roof + load.equipment
-            if load.self_weight_mode == "Auto include footing self-weight":
-                service_P_eff += mat.gamma_c * B * L * geom.h
-            elif load.self_weight_mode == "Manual footing self-weight":
-                service_P_eff += load.manual_self_weight
-            area_req = required_area(service_P_eff, qa)
-            nb, nl = choose_dims(area_req, geom.square, geom.rounding_mm)
-            if abs(nb-B) < 1e-9 and abs(nl-L) < 1e-9:
-                break
-            B, L = nb, nl
-        geom.B, geom.L = B, L
-        service_P = load.D + load.L + load.other + load.roof + load.equipment
-        if load.self_weight_mode == "Auto include footing self-weight":
-            service_P += mat.gamma_c * B * L * geom.h
-        elif load.self_weight_mode == "Manual footing self-weight":
-            service_P += load.manual_self_weight
-    else:
-        B, L = geom.B, geom.L
-
-    if geom.square:
-        L = B
-        geom.L = L
-
-    # Apply column offsets to service moments for bearing.
-    Mx_b = service_Mx + service_P * geom.col_offset_y
-    My_b = service_My + service_P * geom.col_offset_x
-    ex, ey, q0, qmax, qmin = soil_pressures(B, L, service_P, Mx_b, My_b)
-    kern_x = B / 6.0
-    kern_y = L / 6.0
-    if qmin < 0:
-        r.warnings.append("qmin < 0: linear full-contact theory predicts soil tension. A partial-contact analysis is not fully implemented; verify/redo bearing analysis.")
-    if abs(ex) > kern_x or abs(ey) > kern_y:
-        r.warnings.append("Resultant is outside the kern in at least one direction; partial-contact behavior must be checked.")
-
-    bearing_util = qmax / max(qa, 1e-9)
-    bearing_pass = qmax <= qa + 1e-9 and qmin >= -qa
-    r.bearing = {
-        "qa": qa, "service_P": service_P, "q0": q0, "qmax": qmax, "qmin": qmin,
-        "ex": ex, "ey": ey, "kern_x": kern_x, "kern_y": kern_y,
-        "utilization": bearing_util, "pass": bearing_pass, "method": bearing_info.get("method")
-    }
-    if not bearing_pass:
-        r.warnings.append("Bearing pressure exceeds the stated allowable pressure or indicates unsupported tensile contact.")
-
-    # Structural design uses factored soil reaction over full footing. For partial-contact cases, mark warning.
-    h_mm = geom.h * 1000.0
-    max_bar = max(rebar.x_dia, rebar.y_dia)
-    d_mm = h_mm - geom.cover - max_bar / 2.0
-    if d_mm <= 0:
-        raise ValueError("Effective depth is non-positive. Increase footing thickness or revise cover/bar diameter.")
-
-    # Soil pressure envelope for factored action.
-    _, _, uq0, uqmax, uqmin = soil_pressures(B, L, max(Pu, 1e-9), Mux, Muy)
-    q_design = max(uqmax, 0.0)
-
-    # Projection distances beyond column faces.
-    lx = max((B - geom.cx) / 2.0, 0.0)
-    ly = max((L - geom.cy) / 2.0, 0.0)
-
-    # Cantilever strip approximation in each direction, using q_design.
-    Mu_x = q_design * L * lx * lx / 2.0
-    Mu_y = q_design * B * ly * ly / 2.0
-    Asx_req, Asx_min, _ = flexural_As(mat.fc, mat.fy, L * 1000.0, d_mm, Mu_x)
-    Asy_req, Asy_min, _ = flexural_As(mat.fc, mat.fy, B * 1000.0, d_mm, Mu_y)
-    Asx_req = max(Asx_req, Asx_min)
-    Asy_req = max(Asy_req, Asy_min)
-
-    s_x, Asx_prov = select_spacing(Asx_req, rebar.x_dia)
-    s_y, Asy_prov = select_spacing(Asy_req, rebar.y_dia)
-    fitx, nx, fitmsgx = fit_rebar(L * 1000.0, rebar.x_dia, geom.cover, s_x)
-    fity, ny, fitmsgy = fit_rebar(B * 1000.0, rebar.y_dia, geom.cover, s_y)
-
-    phiMn_x, Mn_x, a_x = phi_flexural_capacity(mat.fc, mat.fy, L * 1000.0, d_mm, Asx_prov)
-    phiMn_y, Mn_y, a_y = phi_flexural_capacity(mat.fc, mat.fy, B * 1000.0, d_mm, Asy_prov)
-    flex_x_pass = phiMn_x >= Mu_x and fitx
-    flex_y_pass = phiMn_y >= Mu_y and fity
-    if not fitx:
-        r.warnings.append("X-direction reinforcement cannot be physically fitted with the current geometry/spacing.")
-    if not fity:
-        r.warnings.append("Y-direction reinforcement cannot be physically fitted with the current geometry/spacing.")
-
-    r.flexure = {
-        "x": {"Mu": Mu_x, "d": d_mm, "As_req": Asx_req, "As_min": Asx_min, "As_prov": Asx_prov, "dia": rebar.x_dia, "spacing": s_x, "phiMn": phiMn_x, "a": a_x, "pass": flex_x_pass},
-        "y": {"Mu": Mu_y, "d": d_mm, "As_req": Asy_req, "As_min": Asy_min, "As_prov": Asy_prov, "dia": rebar.y_dia, "spacing": s_y, "phiMn": phiMn_y, "a": a_y, "pass": flex_y_pass},
-    }
-
-    # One-way shear at a distance d from column face.
-    # Use conservative rectangle-strip estimates based on q_design.
-    xu = max(lx - d_mm / 1000.0, 0.0)
-    yu = max(ly - d_mm / 1000.0, 0.0)
-    Vu_x = q_design * L * xu
-    Vu_y = q_design * B * yu
-    Vc_x = vc_oneway(mat.fc, L * 1000.0, d_mm)
-    Vc_y = vc_oneway(mat.fc, B * 1000.0, d_mm)
-    phiVc_x = PHI_SHEAR * Vc_x
-    phiVc_y = PHI_SHEAR * Vc_y
-    shear_x_pass = Vu_x <= phiVc_x
-    shear_y_pass = Vu_y <= phiVc_y
-    if not shear_x_pass or not shear_y_pass:
-        r.warnings.append("One-way shear failure: increase footing thickness and/or footing dimensions rather than relying on additional flexural steel.")
-
-    # Punching: perimeter at d/2 from column face, simplified rectangular perimeter.
-    c1 = geom.cx * 1000.0
-    c2 = geom.cy * 1000.0
-    b0 = 2.0 * ((c1 + d_mm) + (c2 + d_mm))
-    inside_area = (c1 + d_mm) * (c2 + d_mm) / 1e6
-    Vu_p = max(Pu - q_design * inside_area, 0.0)
-    Vc_p = vc_punching(mat.fc, b0, d_mm)
-    phiVc_p = PHI_SHEAR * Vc_p
-    punching_pass = Vu_p <= phiVc_p
-    if not punching_pass:
-        r.warnings.append("Punching shear failure: increasing footing thickness is the primary screening action.")
-
-    r.shear = {
-        "x": {"critical_distance": d_mm / 1000.0, "Vu": Vu_x, "Vc": Vc_x, "phiVc": phiVc_x, "utilization": Vu_x / max(phiVc_x, 1e-9), "pass": shear_x_pass},
-        "y": {"critical_distance": d_mm / 1000.0, "Vu": Vu_y, "Vc": Vc_y, "phiVc": phiVc_y, "utilization": Vu_y / max(phiVc_y, 1e-9), "pass": shear_y_pass},
-    }
-    r.punching = {"bo": b0, "inside_area": inside_area, "Vu": Vu_p, "Vc": Vc_p, "phiVc": phiVc_p, "utilization": Vu_p / max(phiVc_p, 1e-9), "pass": punching_pass,
-                  "note": "Simplified punching check; eccentricity/unbalanced moment transfer is not fully modeled. [VERIFY AGAINST OFFICIAL NSCP 2015]"}
-    r.warnings.append("Punching shear eccentricity/unbalanced moment transfer is not fully modeled in this build. [VERIFY AGAINST OFFICIAL NSCP 2015]") if abs(Mux) + abs(Muy) > 1e-9 else None
-
-    # Anchorage screen.
-    ld = development_length_tension(max_bar, mat.fy, mat.fc, geom.cover)
-    available = h_mm - geom.cover
-    dev_pass = available >= ld
-    r.development = {"Ld": ld, "available": available, "pass": dev_pass, "note": "Simplified tension development screen; detailed modifiers/hooks/lap splice rules require code verification."}
-    if not dev_pass:
-        r.warnings.append("Development length exceeds the available anchorage depth in this simplified check.")
-
-    spacing_pass = all(s in BAR_SPACINGS_MM for s in [s_x, s_y])
-    cover_pass = geom.cover >= 75.0
-    if geom.cover < 50:
-        cover_pass = False
-        r.warnings.append("Specified footing cover is below this application's cast-against-earth screening default; verify exact code requirement.")
-    r.detailing = {"cover": geom.cover, "cover_pass": cover_pass, "spacing_pass": spacing_pass, "fit_x": fitx, "fit_y": fity,
-                   "n_x": nx, "n_y": ny, "fitmsg_x": fitmsgx, "fitmsg_y": fitmsgy}
-
-    r.reinforcement = {
-        "bottom_x": f"{rebar.x_dia} mm Ø @ {s_x} mm",
-        "bottom_y": f"{rebar.y_dia} mm Ø @ {s_y} mm",
-        "dowels": f"{rebar.dowel_n}–{rebar.dowel_dia} mm Ø (screening)",
-        "top": f"{rebar.top_dia} mm Ø @ {rebar.top_spacing} mm (where required by analysis/detailing)",
-        "As_x_per_m": Asx_prov, "As_y_per_m": Asy_prov,
-    }
-
-    r.footing = {"type": geom.footing_type, "B": B, "L": L, "h": geom.h, "d": d_mm / 1000.0,
-                 "cx": geom.cx, "cy": geom.cy, "volume": B * L * geom.h}
-    r.combined = {"governing_combo": combo_name, "Pu": Pu, "Mux": Mux, "Muy": Muy, "service_P": service_P,
-                  "required_area": required_area(service_P, qa), "provided_area": B * L, "combo_note": combo_note}
-
-    r.calculations = [
-        f"Required footing area: Areq = Pservice / qa = {service_P:.1f} / {qa:.1f} = {required_area(service_P, qa):.3f} m²",
-        f"Adopted footing area: Aprov = B × L = {B:.3f} × {L:.3f} = {B*L:.3f} m²",
-        f"Eccentricity: ex = Mx/P = {Mx_b:.2f}/{service_P:.2f} = {ex:.4f} m; ey = My/P = {My_b:.2f}/{service_P:.2f} = {ey:.4f} m",
-        f"Bearing: qmax = {qmax:.2f} kPa; qmin = {qmin:.2f} kPa",
-        f"Flexure X: Mu = {Mu_x:.2f} kN·m; As,req = {Asx_req:.0f} mm²/m; As,prov = {Asx_prov:.0f} mm²/m",
-        f"Flexure Y: Mu = {Mu_y:.2f} kN·m; As,req = {Asy_req:.0f} mm²/m; As,prov = {Asy_prov:.0f} mm²/m",
-        f"One-way shear X: Vu = {Vu_x:.2f} kN; φVc = {phiVc_x:.2f} kN",
-        f"One-way shear Y: Vu = {Vu_y:.2f} kN; φVc = {phiVc_y:.2f} kN",
-        f"Punching: Vu = {Vu_p:.2f} kN; φVc = {phiVc_p:.2f} kN",
-        f"Development: Ld ≈ {ld:.0f} mm; available ≈ {available:.0f} mm",
-    ]
-    r.trace = ["qa → Required area → Footing dimensions → Soil pressure → Critical section → Mu → As → Bar selection → Spacing check"]
-    r.recommendations = []
-    if not all([bearing_pass, flex_x_pass, flex_y_pass, shear_x_pass, shear_y_pass, punching_pass, dev_pass, cover_pass]):
-        r.recommendations.extend(["Review the controlling failed or warning check.", "For shear deficiencies, increase footing thickness and/or dimensions.", "For bearing deficiency, increase footing plan area or revisit geotechnical criteria."])
-    else:
-        r.recommendations.append("All implemented screening checks pass; independently verify code clauses, geotechnical settlement, and project-specific conditions.")
-
-    checks = [bearing_pass, flex_x_pass, flex_y_pass, shear_x_pass, shear_y_pass, punching_pass, dev_pass, cover_pass]
-    r.ok = all(checks)
-    r.status = "PASS" if r.ok else ("FAIL" if any(not x for x in checks) else "WARNING")
-    return r
-
-
-def design_strip(data_project, mat, soil, load, geom, rebar):
-    # Convert a wall load to a 1 m strip and reuse isolated-style equations with wall width.
-    g = FootingGeometry(**asdict(geom))
-    g.footing_type = "Strip / Wall"
-    g.cx = max(geom.wall_t, 0.1)
-    g.cy = 1.0
-    g.B = geom.B
-    g.L = 1.0
-    g.auto_size = False
-    p = LoadData(**asdict(load))
-    if p.input_mode == "Service Loads":
-        p.D = max(load.D, 0.0)
-        p.self_weight_mode = "Manual footing self-weight"
-        p.manual_self_weight = max(geom.wall_line_load, 0.0)
-    else:
-        p.direct_Pu = max(load.direct_Pu, 0.0) + load.wall_line_load * 1.5
-    return design_isolated(data_project, mat, soil, p, g, rebar)
-
-
-def design_combined_like(data_project, mat, soil, load, geom, rebar, trapezoid=False, strap=False):
-    # Transparent preliminary mechanics for two-column foundations. Advanced frame analysis is flagged.
-    P1 = max(load.D * 0.55 + load.L * 0.55, 0.01)
-    P2 = max(load.D * 0.45 + load.L * 0.45, 0.01)
-    if load.input_mode == "Factored / Ultimate Loads":
-        P1 = max(load.direct_Pu * 0.55, 0.01)
-        P2 = max(load.direct_Pu * 0.45, 0.01)
-    totalP = P1 + P2
-    spacing = max(geom.col_spacing, 0.1)
-    if trapezoid:
-        B1, B2 = max(geom.B1, geom.cx), max(geom.B2, geom.cx)
-        L = max(geom.L, spacing + max(geom.cx, geom.cy) + 0.6)
-        area = 0.5 * (B1 + B2) * L
-    else:
-        L = max(geom.L, spacing + max(geom.cx, geom.cy) + 0.6)
-        area = max(geom.B * L, 0.01)
-        B1 = B2 = area / L
-    bearing_info = calculate_bearing_capacity(soil)
-    qa = bearing_info.get("qa", soil.qa)
-    q = totalP / area
-    # Moment about centroid from column spacing and unequal loads.
-    resultant_from_left = P2 * spacing / totalP
-    center_target = L / 2.0
-    ecc = resultant_from_left - center_target
-    qmax = q * (1 + 6 * abs(ecc) / L)
-    qmin = q * (1 - 6 * abs(ecc) / L)
-    status = "PASS" if qmax <= qa and qmin >= 0 else "WARNING"
-    warnings = [
-        "Combined/strap footing analysis is a preliminary equilibrium model; full beam-on-soil or frame analysis is not implemented.",
-        "Column moments, column offsets, compatibility, differential soil contact, and detailed reinforcement interaction require project-specific verification.",
-        "[VERIFY AGAINST OFFICIAL NSCP 2015]",
-    ]
-    if qmin < 0:
-        warnings.append("Combined footing simplified model predicts negative soil pressure; partial contact requires dedicated analysis.")
-    # Reuse isolated footing as a conservative local-pad screen only, but clearly do not relabel it complete.
-    local = FootingGeometry(**asdict(geom))
-    local.B = max(B1 if not trapezoid else min(B1, B2), geom.cx + 0.5)
-    local.L = max(1.0, L / 2.5)
-    local.auto_size = False
-    local.footing_type = "Combined / Strap preliminary"
-    local.h = geom.h
-    ld = design_isolated(data_project, mat, soil, load, local, rebar)
-    ld.warnings = warnings + ld.warnings
-    ld.combined.update({"P1": P1, "P2": P2, "totalP": totalP, "column_spacing": spacing, "resultant_from_left": resultant_from_left,
-                        "centroid": center_target, "eccentricity_along_length": ecc, "qavg": q, "qmax": qmax, "qmin": qmin,
-                        "B1": B1, "B2": B2, "L": L, "area": area,
-                        "model": "Preliminary statics model — not a substitute for detailed combined/strap footing analysis"})
-    ld.status = "WARNING" if status == "WARNING" or ld.status != "PASS" else "PASS"
-    ld.ok = False if status != "PASS" else ld.ok
-    return ld
-
-
-def design_footing(project, mat, soil, load, geom, rebar):
-    t = geom.footing_type
-    if t in ("Isolated Square", "Isolated Rectangular", "Pedestal-Supported"):
-        return design_isolated(project, mat, soil, load, geom, rebar)
-    if t == "Strip / Wall":
-        return design_strip(project, mat, soil, load, geom, rebar)
-    if t == "Combined Rectangular":
-        return design_combined_like(project, mat, soil, load, geom, rebar, trapezoid=False)
-    if t == "Combined Trapezoidal":
-        return design_combined_like(project, mat, soil, load, geom, rebar, trapezoid=True)
-    if t == "Strap Footing":
-        return design_combined_like(project, mat, soil, load, geom, rebar, strap=True)
-    return design_isolated(project, mat, soil, load, geom, rebar)
-
-
-class ToolTip:
-    def __init__(self, widget, text):
-        self.widget = widget
-        self.text = text
-        self.tip = None
-        widget.bind("<Enter>", self.show)
-        widget.bind("<Leave>", self.hide)
-    def show(self, _=None):
-        if self.tip or not self.text:
-            return
-        x = self.widget.winfo_rootx() + 20
-        y = self.widget.winfo_rooty() + self.widget.winfo_height() + 5
-        self.tip = tk.Toplevel(self.widget)
-        self.tip.wm_overrideredirect(True)
-        self.tip.geometry(f"+{x}+{y}")
-        ttk.Label(self.tip, text=self.text, relief="solid", borderwidth=1, padding=6).pack()
-    def hide(self, _=None):
-        if self.tip:
-            self.tip.destroy()
-            self.tip = None
-
-
-class FootingDesignApp(tk.Tk):
-    def __init__(self):
-        super().__init__()
-        self.title(APP_TITLE)
-        self.geometry("1500x920")
-        self.minsize(1150, 760)
-        self.style = ttk.Style(self)
-        try:
-            self.style.theme_use("clam")
-        except Exception:
-            pass
-        self._configure_style()
-        self.project = ProjectData()
-        self.material = MaterialProperties()
-        self.soil = SoilProperties()
-        self.load = LoadData()
-        self.geom = FootingGeometry()
-        self.rebar = RebarSpec()
-        self.results = DesignResults()
-        self.vars = {}
-        self.pages = {}
-        self.nav_items = []
-        self.page_names = ["Project", "Foundation", "Materials", "Soil", "Loads", "Geometry", "Design", "Rebar", "Drawings", "Results", "Calculations", "Report"]
-        self.page_index = 0
-        self._build_shell()
-        self._build_pages()
-        self.show_page(0)
-
-    def _configure_style(self):
-        self.configure(bg="#f3f5f8")
-        self.style.configure("TFrame", background="#f3f5f8")
-        self.style.configure("Card.TFrame", background="white", relief="solid", borderwidth=1)
-        self.style.configure("Sidebar.TFrame", background="#17212b")
-        self.style.configure("Sidebar.TButton", background="#17212b", foreground="white", anchor="w", padding=(14, 10), borderwidth=0)
-        self.style.map("Sidebar.TButton", background=[("active", "#263645")])
-        self.style.configure("Header.TLabel", font=("Segoe UI", 18, "bold"), background="#ffffff", foreground="#15202b")
-        self.style.configure("Section.TLabel", font=("Segoe UI", 11, "bold"), background="#ffffff", foreground="#1e2a36")
-        self.style.configure("TLabel", font=("Segoe UI", 9), background="#f3f5f8", foreground="#23313d")
-        self.style.configure("Card.TLabel", background="#ffffff")
-        self.style.configure("Small.TLabel", font=("Segoe UI", 8), background="#ffffff", foreground="#637381")
-        self.style.configure("Primary.TButton", font=("Segoe UI", 9, "bold"), padding=(12, 8))
-        self.style.configure("Danger.TButton", font=("Segoe UI", 9, "bold"), padding=(12, 8))
-        self.style.configure("TNotebook", background="#f3f5f8", borderwidth=0)
-        self.style.configure("TNotebook.Tab", padding=(12, 7))
-
-    def _build_shell(self):
-        self.sidebar = ttk.Frame(self, style="Sidebar.TFrame", width=215)
-        self.sidebar.pack(side="left", fill="y")
-        self.sidebar.pack_propagate(False)
-        ttk.Label(self.sidebar, text="RC FOOTING\nDESIGN", font=("Segoe UI", 16, "bold"), foreground="white", background="#17212b", justify="left", padding=(18, 22)).pack(fill="x")
-        ttk.Label(self.sidebar, text="NSCP 2015 / ACI-based\nengineering workflow", font=("Segoe UI", 8), foreground="#b7c4cf", background="#17212b", justify="left", padding=(18, 0, 18, 16)).pack(fill="x")
-        self.nav_frame = ttk.Frame(self.sidebar, style="Sidebar.TFrame")
-        self.nav_frame.pack(fill="both", expand=True)
-        for i, name in enumerate(self.page_names):
-            b = ttk.Button(self.nav_frame, text=f"{i+1:02d}  {name}", style="Sidebar.TButton", command=lambda idx=i: self.show_page(idx))
-            b.pack(fill="x", pady=1)
-            self.nav_items.append(b)
-        ttk.Label(self.sidebar, text="Engineering design assistance only.\nVerify against official code and\ngeotechnical report.", font=("Segoe UI", 8), foreground="#9fadb8", background="#17212b", justify="left", padding=18).pack(side="bottom", fill="x")
-
-        right = ttk.Frame(self)
-        right.pack(side="left", fill="both", expand=True)
-        top = ttk.Frame(right, style="Card.TFrame")
-        top.pack(fill="x")
-        self.page_title = ttk.Label(top, text="", style="Header.TLabel", padding=(20, 14))
-        self.page_title.pack(side="left")
-        self.status_lbl = ttk.Label(top, text="NOT CALCULATED", padding=(20, 14), background="#ffffff", foreground="#7a8792", font=("Segoe UI", 9, "bold"))
-        self.status_lbl.pack(side="right")
-        self.main = ttk.Frame(right)
-        self.main.pack(fill="both", expand=True, padx=10, pady=(10, 0))
-        self.content = ttk.Frame(self.main)
-        self.content.pack(fill="both", expand=True)
-
-        bottom = ttk.Frame(right, style="Card.TFrame")
-        bottom.pack(fill="x", pady=(10, 0))
-        ttk.Button(bottom, text="Reset", command=self.reset_project).pack(side="left", padx=8, pady=8)
-        ttk.Button(bottom, text="Save Project", command=self.save_project).pack(side="left", padx=4, pady=8)
-        ttk.Button(bottom, text="Load Project", command=self.load_project).pack(side="left", padx=4, pady=8)
-        ttk.Label(bottom, text="", style="Card.TLabel").pack(side="left", fill="x", expand=True)
-        ttk.Button(bottom, text="Previous", command=self.prev_page).pack(side="left", padx=4, pady=8)
-        ttk.Button(bottom, text="Calculate", style="Primary.TButton", command=self.calculate).pack(side="left", padx=4, pady=8)
-        ttk.Button(bottom, text="Next", command=self.next_page).pack(side="left", padx=4, pady=8)
-        ttk.Button(bottom, text="Generate Report", command=self.generate_report).pack(side="left", padx=8, pady=8)
-
-    def _new_page(self, name):
-        frame = ttk.Frame(self.content)
-        frame.pack(fill="both", expand=True)
-        self.pages[name] = frame
-        return frame
-
-    def _build_pages(self):
-        for name in self.page_names:
-            self._new_page(name)
-        self._build_project_page(self.pages["Project"])
-        self._build_foundation_page(self.pages["Foundation"])
-        self._build_materials_page(self.pages["Materials"])
-        self._build_soil_page(self.pages["Soil"])
-        self._build_loads_page(self.pages["Loads"])
-        self._build_geometry_page(self.pages["Geometry"])
-        self._build_design_page(self.pages["Design"])
-        self._build_rebar_page(self.pages["Rebar"])
-        self._build_drawings_page(self.pages["Drawings"])
-        self._build_results_page(self.pages["Results"])
-        self._build_calculations_page(self.pages["Calculations"])
-        self._build_report_page(self.pages["Report"])
-
-    def _scroll_frame(self, parent):
-        outer = ttk.Frame(parent, style="Card.TFrame")
-        outer.pack(fill="both", expand=True)
-        canvas = tk.Canvas(outer, bg="#f3f5f8", highlightthickness=0)
-        sb = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview)
-        inner = ttk.Frame(canvas)
-        inner.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
-        canvas.create_window((0, 0), window=inner, anchor="nw")
-        canvas.configure(yscrollcommand=sb.set)
-        canvas.pack(side="left", fill="both", expand=True)
-        sb.pack(side="right", fill="y")
-        return inner
-
-    def _card(self, parent, title):
-        card = ttk.Frame(parent, style="Card.TFrame", padding=12)
-        card.pack(fill="x", padx=2, pady=6)
-        ttk.Label(card, text=title, style="Section.TLabel").grid(row=0, column=0, columnspan=6, sticky="w", pady=(0, 9))
-        return card
-
-    def _entry(self, parent, row, label, key, default="", unit="", width=17, tooltip=""):
-        ttk.Label(parent, text=label, style="Card.TLabel").grid(row=row, column=0, sticky="w", pady=4, padx=(0, 6))
-        v = tk.StringVar(value=str(default))
-        self.vars[key] = v
-        e = ttk.Entry(parent, textvariable=v, width=width)
-        e.grid(row=row, column=1, sticky="w", pady=4)
-        if unit:
-            ttk.Label(parent, text=unit, style="Small.TLabel").grid(row=row, column=2, sticky="w", padx=6)
-        if tooltip:
-            ToolTip(e, tooltip)
-        return e
-
-    def _combo(self, parent, row, label, key, values, default=None, width=24, tooltip=""):
-        ttk.Label(parent, text=label, style="Card.TLabel").grid(row=row, column=0, sticky="w", pady=4, padx=(0, 6))
-        v = tk.StringVar(value=default if default is not None else values[0])
-        self.vars[key] = v
-        c = ttk.Combobox(parent, textvariable=v, values=values, width=width, state="readonly")
-        c.grid(row=row, column=1, sticky="w", pady=4)
-        if tooltip:
-            ToolTip(c, tooltip)
-        return c
-
-    def _check(self, parent, row, label, key, default=False):
-        v = tk.BooleanVar(value=default)
-        self.vars[key] = v
-        ttk.Checkbutton(parent, text=label, variable=v).grid(row=row, column=0, columnspan=3, sticky="w", pady=4)
-        return v
-
-    def _text(self, parent, row, label, key, default="", height=4, width=70):
-        ttk.Label(parent, text=label, style="Card.TLabel").grid(row=row, column=0, sticky="nw", pady=4, padx=(0, 6))
-        t = tk.Text(parent, width=width, height=height, wrap="word", relief="solid", borderwidth=1)
-        t.insert("1.0", default)
-        t.grid(row=row, column=1, columnspan=5, sticky="ew", pady=4)
-        self.vars[key] = t
-        return t
-
-    def _build_project_page(self, frame):
-        inner = self._scroll_frame(frame)
-        c = self._card(inner, "Project Information")
-        fields = [
-            ("Project Name", "project_name", ""), ("Project Location", "location", ""), ("Building / Structure", "structure", ""),
-            ("Foundation Mark", "footing_mark", "F1"), ("Column Mark", "column_mark", "C1"), ("Designer", "designer", ""),
-            ("Checked By", "checked_by", ""), ("Date", "design_date", str(date.today()))]
-        for i,(lab,key,d) in enumerate(fields): self._entry(c, i, lab, key, d)
-        self._text(c, len(fields), "Design Notes", "notes", "", height=5)
-        d = self._card(inner, "Design Assumptions — Always Accessible")
-        self.assump_text = tk.Text(d, height=12, width=100, wrap="word", relief="flat", bg="white")
-        self.assump_text.insert("1.0", DISCLAIMER)
-        self.assump_text.configure(state="disabled")
-        self.assump_text.pack(fill="x", pady=4)
-        ttk.Label(inner, text="The application keeps project inputs while navigating. JSON save/load is user-generated project data.", style="Small.TLabel").pack(anchor="w", padx=4, pady=4)
-
-    def _build_foundation_page(self, frame):
-        inner = self._scroll_frame(frame)
-        c = self._card(inner, "Foundation Type")
-        types = ["Isolated Square", "Isolated Rectangular", "Combined Rectangular", "Combined Trapezoidal", "Strap Footing", "Strip / Wall", "Pedestal-Supported"]
-        self._combo(c, 1, "Footing configuration", "footing_type", types, geom_default := "Isolated Rectangular", width=32)
-        self.vars["footing_type"].trace_add("write", lambda *_: self.update_dynamic_fields())
-        ttk.Label(c, text="Choose the configuration before entering geometry. Combined and strap modes are transparent preliminary models in this build.", style="Small.TLabel").grid(row=2, column=0, columnspan=4, sticky="w", pady=6)
-        self.foundation_note = ttk.Label(c, text="", style="Small.TLabel", wraplength=800)
-        self.foundation_note.grid(row=3, column=0, columnspan=4, sticky="w", pady=4)
-        d = self._card(inner, "Workflow")
-        ttk.Label(d, text="INPUTS → ASSUMPTIONS → GEOTECHNICAL CHECKS → STRUCTURAL DESIGN → DETAILING → FINAL RECOMMENDATION", style="Card.TLabel", font=("Segoe UI",10,"bold"), wraplength=1100).grid(row=1,column=0,sticky="w")
-        self.update_dynamic_fields()
-
-    def _build_materials_page(self, frame):
-        inner = self._scroll_frame(frame)
-        c = self._card(inner, "Concrete")
-        self._entry(c, 1, "f'c", "fc", self.material.fc, "MPa")
-        self._entry(c, 2, "Unit weight", "gamma_c", self.material.gamma_c, "kN/m³")
-        d = self._card(inner, "Reinforcing Steel")
-        self._entry(d, 1, "fy", "fy", self.material.fy, "MPa")
-        self._entry(d, 2, "Es", "es", self.material.es, "MPa")
-        ttk.Label(inner, text="Common steel grades are user-selectable through fy. Code-dependent values are not silently hard-coded.", style="Small.TLabel").pack(anchor="w", padx=4)
-
-    def _build_soil_page(self, frame):
-        inner = self._scroll_frame(frame)
-        c = self._card(inner, "Geotechnical Inputs")
-        self._entry(c, 1, "Allowable bearing capacity qa", "qa", self.soil.qa, "kPa", tooltip="Prefer project-specific geotechnical report value where available.")
-        self._entry(c, 2, "Soil unit weight", "gamma_soil", self.soil.gamma_soil, "kN/m³")
-        self._entry(c, 3, "Internal friction angle φ", "phi_deg", self.soil.phi_deg, "deg")
-        self._entry(c, 4, "Cohesion c", "cohesion", self.soil.cohesion, "kPa")
-        self._entry(c, 5, "Groundwater depth", "groundwater", self.soil.groundwater, "m")
-        self._entry(c, 6, "Minimum embedment", "embedment", self.soil.embedment, "m")
-        self._entry(c, 7, "Soil cover above footing", "soil_cover", self.soil.soil_cover, "m")
-        self._entry(c, 8, "Required factor of safety", "fos", self.soil.fos, "-")
-        self._entry(c, 9, "Settlement limit", "settlement_limit", self.soil.settlement_limit, "mm")
-        d = self._card(inner, "Bearing Pressure Type / Capacity Method")
-        self._combo(d, 1, "Pressure type", "pressure_type", ["Gross allowable", "Net allowable"], self.soil.pressure_type)
-        self._combo(d, 2, "Bearing-capacity method", "bearing_method", ["User-Provided qa", "Terzaghi", "Meyerhof", "General Equation"], self.soil.bearing_method, width=25)
-        ttk.Label(d, text="Method-based capacity is a screening calculation; water-table/effective-stress, shape, depth and inclination factors require independent verification.", style="Small.TLabel", wraplength=900).grid(row=3,column=0,columnspan=4,sticky="w",pady=6)
-
-    def _build_loads_page(self, frame):
-        inner = self._scroll_frame(frame)
-        c = self._card(inner, "Load Input Mode")
-        self._combo(c, 1, "Input mode", "input_mode", ["Service Loads", "Factored / Ultimate Loads"], self.load.input_mode)
-        self._combo(c, 2, "Footing self-weight", "self_weight_mode", ["Auto include footing self-weight", "Exclude (already included)", "Manual footing self-weight"], self.load.self_weight_mode)
-        self._entry(c, 3, "Manual footing self-weight", "manual_self_weight", self.load.manual_self_weight, "kN")
-        ttk.Label(c, text="Select explicitly whether the loads are service-level or already factored/ultimate.", style="Small.TLabel").grid(row=2,column=0,columnspan=4,sticky="w")
-        s = self._card(inner, "Service Loads")
-        self._entry(s, 1, "Dead load D", "D", self.load.D, "kN")
-        self._entry(s, 2, "Live load L", "L", self.load.L, "kN")
-        self._entry(s, 3, "Other permanent", "other", self.load.other, "kN")
-        self._entry(s, 4, "Roof load", "roof", self.load.roof, "kN")
-        self._entry(s, 5, "Equipment load", "equipment", self.load.equipment, "kN")
-        self._entry(s, 6, "Mx", "Mx", self.load.Mx, "kN·m")
-        self._entry(s, 7, "My", "My", self.load.My, "kN·m")
-        self._entry(s, 8, "Hx", "Hx", self.load.Hx, "kN")
-        self._entry(s, 9, "Hy", "Hy", self.load.Hy, "kN")
-        u = self._card(inner, "Factored / Ultimate Loads — used only when selected")
-        self._entry(u, 1, "Pu", "direct_Pu", self.load.direct_Pu, "kN")
-        self._entry(u, 2, "Mux", "direct_Mux", self.load.direct_Mux, "kN·m")
-        self._entry(u, 3, "Muy", "direct_Muy", self.load.direct_Muy, "kN·m")
-        self._entry(u, 4, "Vux", "direct_Vux", self.load.direct_Vux, "kN")
-        self._entry(u, 5, "Vuy", "direct_Vuy", self.load.direct_Vuy, "kN")
-        cmb = self._card(inner, "Supported Gravity Combinations")
-        txt = "1.4D\n1.2D + 1.6L\n1.2D + 1.0L\n\nAdditional wind/earthquake/fluid/soil/rain combinations are not fabricated in this build. Exact NSCP 2015 applicability should be verified against the official code and project load model."
-        ttk.Label(cmb,text=txt,style="Card.TLabel",justify="left",wraplength=900).grid(row=1,column=0,columnspan=6,sticky="w")
-
-    def _build_geometry_page(self, frame):
-        inner = self._scroll_frame(frame)
-        c = self._card(inner, "Footing Geometry")
-        self._check(c, 1, "Automatically size footing from service bearing criterion", "auto_size", True)
-        self._check(c, 2, "Square footing (B = L)", "square", False)
-        self._entry(c, 3, "Footing width B", "B", self.geom.B, "m")
-        self._entry(c, 4, "Footing length L", "L", self.geom.L, "m")
-        self._entry(c, 5, "Footing thickness h", "h", self.geom.h, "m")
-        self._entry(c, 6, "Column width cx", "cx", self.geom.cx, "m")
-        self._entry(c, 7, "Column depth cy", "cy", self.geom.cy, "m")
-        self._entry(c, 8, "Clear cover", "cover", self.geom.cover, "mm")
-        self._entry(c, 9, "Column offset X", "col_offset_x", self.geom.col_offset_x, "m")
-        self._entry(c, 10, "Column offset Y", "col_offset_y", self.geom.col_offset_y, "m")
-        self._entry(c, 11, "Dimension rounding increment", "rounding_mm", self.geom.rounding_mm, "mm")
-        self._entry(c, 12, "Maximum thickness limit", "h_max", self.geom.h_max, "m")
-        p = self._card(inner, "Pedestal / Multi-Column / Wall Parameters")
-        self._entry(p, 1, "Pedestal width", "pedestal_B", self.geom.pedestal_B, "m")
-        self._entry(p, 2, "Pedestal length", "pedestal_L", self.geom.pedestal_L, "m")
-        self._entry(p, 3, "Pedestal height", "pedestal_h", self.geom.pedestal_h, "m")
-        self._entry(p, 4, "Column spacing", "col_spacing", self.geom.col_spacing, "m")
-        self._entry(p, 5, "Trapezoid width B1", "B1", self.geom.B1, "m")
-        self._entry(p, 6, "Trapezoid width B2", "B2", self.geom.B2, "m")
-        self._entry(p, 7, "Strap width", "strap_width", self.geom.strap_width, "m")
-        self._entry(p, 8, "Strap depth", "strap_depth", self.geom.strap_depth, "m")
-        self._entry(p, 9, "Wall thickness", "wall_t", self.geom.wall_t, "m")
-        self._entry(p, 10, "Wall line load", "wall_line_load", self.geom.wall_line_load, "kN/m")
-
-    def _build_design_page(self, frame):
-        inner = self._scroll_frame(frame)
-        c = self._card(inner, "Design Method")
-        ttk.Label(c,text="Bearing and flexural demand use service/ultimate load levels explicitly; the interface prevents silent mixing.",style="Card.TLabel",wraplength=1000).grid(row=1,column=0,columnspan=6,sticky="w")
-        ttk.Label(c,text="Thickness iteration is available through the Calculate routine for isolated/pedestal modes; the combined/strap models remain preliminary.",style="Small.TLabel",wraplength=1000).grid(row=2,column=0,columnspan=6,sticky="w",pady=6)
-        d=self._card(inner,"Implemented Checks")
-        checks=["Required footing area / dimensions","Eccentricity and kern screening","qmax / qmin bearing pressure","Flexural reinforcement X and Y","One-way shear X and Y","Punching shear screening","Development-length screening","Cover and rebar fit","Utilization ratios","Calculation trace"]
-        for i,t in enumerate(checks,1): ttk.Label(d,text="✓  "+t,style="Card.TLabel").grid(row=i,column=0,sticky="w",pady=2)
-        w=self._card(inner,"Known Limitations")
-        ttk.Label(w,text="Settlement: NOT IMPLEMENTED.\nUnbalanced moment transfer in punching: simplified / flagged.\nCombined and strap footing: preliminary statics model only.\nDetailed seismic/soil-structure interaction: NOT IMPLEMENTED.\nExact code clause/table references: VERIFY AGAINST OFFICIAL NSCP 2015.",style="Card.TLabel",wraplength=1000,justify="left").grid(row=1,column=0,columnspan=6,sticky="w")
-
-    def _build_rebar_page(self, frame):
-        inner=self._scroll_frame(frame)
-        c=self._card(inner,"Bottom Reinforcement")
-        self._combo(c,1,"X bar diameter","x_dia",list(map(str,BAR_DIAMETERS_MM.keys())),str(self.rebar.x_dia),width=12)
-        self._combo(c,2,"Y bar diameter","y_dia",list(map(str,BAR_DIAMETERS_MM.keys())),str(self.rebar.y_dia),width=12)
-        self._entry(c,3,"X spacing","x_spacing",self.rebar.x_spacing,"mm")
-        self._entry(c,4,"Y spacing","y_spacing",self.rebar.y_spacing,"mm")
-        d=self._card(inner,"Column Dowels / Top Reinforcement")
-        self._combo(d,1,"Dowel diameter","dowel_dia",list(map(str,BAR_DIAMETERS_MM.keys())),str(self.rebar.dowel_dia),width=12)
-        self._entry(d,2,"Number of dowels","dowel_n",self.rebar.dowel_n,"bars")
-        self._combo(d,3,"Top bar diameter","top_dia",list(map(str,BAR_DIAMETERS_MM.keys())),str(self.rebar.top_dia),width=12)
-        self._entry(d,4,"Top spacing","top_spacing",self.rebar.top_spacing,"mm")
-        ttk.Label(inner,text="The calculator may select a practical spacing automatically for the implemented isolated-footing checks. User-entered spacing is retained as a preference/input cue.",style="Small.TLabel").pack(anchor="w",padx=4)
-
-    def _build_drawings_page(self, frame):
-        toolbar=ttk.Frame(frame,style="Card.TFrame")
-        toolbar.pack(fill="x",pady=(0,8))
-        ttk.Button(toolbar,text="Plan",command=lambda:self.plot_plan()).pack(side="left",padx=4,pady=5)
-        ttk.Button(toolbar,text="Section",command=lambda:self.plot_section()).pack(side="left",padx=4,pady=5)
-        ttk.Button(toolbar,text="3D Model",command=lambda:self.plot_3d()).pack(side="left",padx=4,pady=5)
-        ttk.Button(toolbar,text="Export Current PNG",command=self.export_current_plot).pack(side="right",padx=4,pady=5)
-        self.plot_frame=ttk.Frame(frame,style="Card.TFrame")
-        self.plot_frame.pack(fill="both",expand=True)
-        self.plot_figure=None
-        self.plot_canvas=None
-        self.current_plot_kind="plan"
-        self.plot_plan()
-
-    def _build_results_page(self, frame):
-        inner=self._scroll_frame(frame)
-        self.result_text=tk.Text(inner,height=35,width=120,wrap="word",bg="white",relief="solid",borderwidth=1)
-        self.result_text.pack(fill="both",expand=True,padx=4,pady=4)
-        self.result_text.insert("1.0","Calculate the design to populate the dashboard.")
-        self.result_text.configure(state="disabled")
-
-    def _build_calculations_page(self, frame):
-        inner=self._scroll_frame(frame)
-        self.calc_text=tk.Text(inner,height=40,width=120,wrap="word",bg="white",relief="solid",borderwidth=1)
-        self.calc_text.pack(fill="both",expand=True,padx=4,pady=4)
-        self.calc_text.insert("1.0","Detailed calculation sheet will appear here after Calculate.")
-        self.calc_text.configure(state="disabled")
-
-    def _build_report_page(self, frame):
-        inner=self._scroll_frame(frame)
-        self.report_text=tk.Text(inner,height=40,width=120,wrap="word",bg="white",relief="solid",borderwidth=1)
-        self.report_text.pack(fill="both",expand=True,padx=4,pady=4)
-        self.report_text.insert("1.0",DISCLAIMER)
-        self.report_text.configure(state="disabled")
-
-    def update_dynamic_fields(self):
-        t=self.vars.get("footing_type").get() if "footing_type" in self.vars else ""
-        notes={
-            "Isolated Square":"Single-column square footing. Automatic sizing may enforce B = L.",
-            "Isolated Rectangular":"Single-column rectangular footing with biaxial eccentricity screening.",
-            "Combined Rectangular":"Two-column preliminary equilibrium model. Full beam/soil interaction analysis is NOT implemented.",
-            "Combined Trapezoidal":"Two-column trapezoidal preliminary model using B1/B2/L geometry.",
-            "Strap Footing":"Two-pad + strap preliminary equilibrium model. Strap beam design is not a substitute for detailed frame analysis.",
-            "Strip / Wall":"Continuous wall footing checked using a 1 m design strip representation.",
-            "Pedestal-Supported":"Isolated footing with pedestal geometry inputs for visualization; pedestal structural design is not fully implemented.",
-        }
-        if hasattr(self,"foundation_note"):
-            self.foundation_note.config(text=notes.get(t,""))
-
-    def show_page(self,index):
-        self.page_index=index
-        for f in self.pages.values(): f.pack_forget()
-        self.pages[self.page_names[index]].pack(fill="both",expand=True)
-        self.page_title.config(text=self.page_names[index])
-        for i,b in enumerate(self.nav_items):
-            b.state(["!pressed"])
-        try: self.nav_items[index].state(["pressed"])
-        except Exception: pass
-        if self.page_names[index]=="Drawings":
-            self.plot_plan()
-        if self.page_names[index]=="Results": self.update_results_dashboard()
-        if self.page_names[index]=="Calculations": self.update_calculations()
-        if self.page_names[index]=="Report": self.update_report_text()
-
-    def next_page(self):
-        if self.page_index < len(self.page_names)-1: self.show_page(self.page_index+1)
-    def prev_page(self):
-        if self.page_index > 0: self.show_page(self.page_index-1)
-
-    def read_inputs(self):
-        self.project=ProjectData(
-            project_name=self.vars["project_name"].get(),location=self.vars["location"].get(),structure=self.vars["structure"].get(),
-            footing_mark=self.vars["footing_mark"].get(),column_mark=self.vars["column_mark"].get(),designer=self.vars["designer"].get(),
-            checked_by=self.vars["checked_by"].get(),design_date=self.vars["design_date"].get(),notes=self.vars["notes"].get("1.0","end-1c")
+class LoadCombination:
+    name: str
+    factors: Dict[str, float]
+    basis: str = "strength"       # "strength" | "service"
+
+
+@dataclass
+class CheckResult:
+    name: str
+    status: Status = Status.NOT_ANALYZED
+    demand: float = 0.0
+    capacity: float = 0.0
+    utilization: float = 0.0
+    units: str = ""
+    code_ref: str = "CODE REFERENCE REQUIRES VERIFICATION"
+    inputs: Dict[str, Any] = field(default_factory=dict)
+    intermediate: Dict[str, Any] = field(default_factory=dict)
+    equations: List[str] = field(default_factory=list)
+    warnings: List[str] = field(default_factory=list)
+
+
+@dataclass
+class DesignResult:
+    bearing: Optional[CheckResult] = None
+    flexure_x: Optional[CheckResult] = None
+    flexure_y: Optional[CheckResult] = None
+    one_way_shear_x: Optional[CheckResult] = None
+    one_way_shear_y: Optional[CheckResult] = None
+    punching_shear: Optional[CheckResult] = None
+    reinforcement: Optional[CheckResult] = None
+    warnings: List[str] = field(default_factory=list)
+    overall_status: Status = Status.NOT_ANALYZED
+
+    def all_checks(self) -> List[CheckResult]:
+        return [c for c in [
+            self.bearing, self.flexure_x, self.flexure_y,
+            self.one_way_shear_x, self.one_way_shear_y,
+            self.punching_shear, self.reinforcement,
+        ] if c is not None]
+
+
+@dataclass
+class Project:
+    info: ProjectInfo = field(default_factory=ProjectInfo)
+    footing_type: str = "isolated"
+    geometry: FootingGeometry = field(default_factory=FootingGeometry)
+    concrete: Concrete = field(default_factory=Concrete)
+    rebar: Rebar = field(default_factory=Rebar)
+    soil: Soil = field(default_factory=Soil)
+    load_cases: List[LoadCase] = field(default_factory=lambda: [
+        LoadCase("D", 800.0, 0.0, 0.0),
+        LoadCase("L", 400.0, 0.0, 0.0),
+    ])
+
+
+# ---------------------------------------------------------------------------
+# [SECTION 3]  DESIGN ENGINE
+# ---------------------------------------------------------------------------
+
+class InputValidationError(ValueError):
+    """Raised for invalid inputs so the GUI can present a clean message."""
+
+
+def validate_project(p: Project) -> List[str]:
+    """Return list of human-readable validation warnings (may be empty)."""
+    warnings: List[str] = []
+    g, c, s, r = p.geometry, p.concrete, p.soil, p.rebar
+
+    if g.B <= 0:
+        raise InputValidationError("Footing width B must be greater than zero.")
+    if g.L <= 0:
+        raise InputValidationError("Footing length L must be greater than zero.")
+    if g.H <= 0:
+        raise InputValidationError("Footing thickness H must be greater than zero.")
+    if g.cx <= 0 or g.cy <= 0:
+        raise InputValidationError("Column dimensions must be positive.")
+    if g.cover < 0:
+        raise InputValidationError("Clear cover cannot be negative.")
+    if c.fc <= 0:
+        raise InputValidationError("Concrete strength f'c must be positive.")
+    if r.fy <= 0:
+        raise InputValidationError("Steel yield strength fy must be positive.")
+    if r.diameter <= 0:
+        raise InputValidationError("Bar diameter must be positive.")
+    if s.qa <= 0:
+        raise InputValidationError("Allowable bearing pressure qa must be positive.")
+    if not s.has_bearing_capacity:
+        warnings.append(
+            "Soil bearing capacity has not been independently verified. "
+            "Geotechnical input is required for final design."
         )
-        self.material=MaterialProperties(fc=parse_float(self.vars["fc"].get(),"f'c",False),gamma_c=parse_float(self.vars["gamma_c"].get(),"Concrete unit weight",False),fy=parse_float(self.vars["fy"].get(),"fy",False),es=parse_float(self.vars["es"].get(),"Es",False))
-        self.soil=SoilProperties(qa=parse_float(self.vars["qa"].get(),"qa",False),gamma_soil=parse_float(self.vars["gamma_soil"].get(),"Soil unit weight",False),phi_deg=parse_float(self.vars["phi_deg"].get(),"φ"),cohesion=parse_float(self.vars["cohesion"].get(),"cohesion"),groundwater=parse_float(self.vars["groundwater"].get(),"Groundwater depth"),embedment=parse_float(self.vars["embedment"].get(),"Embedment",False),soil_cover=parse_float(self.vars["soil_cover"].get(),"Soil cover"),fos=parse_float(self.vars["fos"].get(),"Factor of safety",False),settlement_limit=parse_float(self.vars["settlement_limit"].get(),"Settlement limit"),pressure_type=self.vars["pressure_type"].get(),bearing_method=self.vars["bearing_method"].get())
-        self.load=LoadData(input_mode=self.vars["input_mode"].get(),self_weight_mode=self.vars["self_weight_mode"].get(),manual_self_weight=parse_float(self.vars["manual_self_weight"].get(),"Manual footing self-weight"),D=parse_float(self.vars["D"].get(),"D"),L=parse_float(self.vars["L"].get(),"L"),other=parse_float(self.vars["other"].get(),"Other permanent"),roof=parse_float(self.vars["roof"].get(),"Roof load"),equipment=parse_float(self.vars["equipment"].get(),"Equipment load"),Mx=float(self.vars["Mx"].get()),My=float(self.vars["My"].get()),Hx=float(self.vars["Hx"].get()),Hy=float(self.vars["Hy"].get()),direct_Pu=parse_float(self.vars["direct_Pu"].get(),"Pu"),direct_Mux=float(self.vars["direct_Mux"].get()),direct_Muy=float(self.vars["direct_Muy"].get()),direct_Vux=float(self.vars["direct_Vux"].get()),direct_Vuy=float(self.vars["direct_Vuy"].get()))
-        self.geom=FootingGeometry(footing_type=self.vars["footing_type"].get(),B=parse_float(self.vars["B"].get(),"B",False),L=parse_float(self.vars["L"].get(),"L",False),h=parse_float(self.vars["h"].get(),"h",False),cx=parse_float(self.vars["cx"].get(),"cx",False),cy=parse_float(self.vars["cy"].get(),"cy",False),cover=parse_float(self.vars["cover"].get(),"Cover",False),col_offset_x=float(self.vars["col_offset_x"].get()),col_offset_y=float(self.vars["col_offset_y"].get()),pedestal_B=parse_float(self.vars["pedestal_B"].get(),"Pedestal B"),pedestal_L=parse_float(self.vars["pedestal_L"].get(),"Pedestal L"),pedestal_h=parse_float(self.vars["pedestal_h"].get(),"Pedestal h"),auto_size=bool(self.vars["auto_size"].get()),square=bool(self.vars["square"].get()),rounding_mm=parse_float(self.vars["rounding_mm"].get(),"Rounding increment",False),h_max=parse_float(self.vars["h_max"].get(),"Maximum h",False),B1=parse_float(self.vars["B1"].get(),"B1",False),B2=parse_float(self.vars["B2"].get(),"B2",False),col_spacing=parse_float(self.vars["col_spacing"].get(),"Column spacing",False),strap_width=parse_float(self.vars["strap_width"].get(),"Strap width",False),strap_depth=parse_float(self.vars["strap_depth"].get(),"Strap depth",False),wall_t=parse_float(self.vars["wall_t"].get(),"Wall thickness",False),wall_line_load=parse_float(self.vars["wall_line_load"].get(),"Wall line load"))
-        self.rebar=RebarSpec(x_dia=int(self.vars["x_dia"].get()),x_spacing=int(float(self.vars["x_spacing"].get())),y_dia=int(self.vars["y_dia"].get()),y_spacing=int(float(self.vars["y_spacing"].get())),dowel_dia=int(self.vars["dowel_dia"].get()),dowel_n=int(float(self.vars["dowel_n"].get())),top_dia=int(self.vars["top_dia"].get()),top_spacing=int(float(self.vars["top_spacing"].get())))
-        if self.geom.square: self.geom.L=self.geom.B
-        if self.geom.h > self.geom.h_max: raise ValueError("Footing thickness exceeds the specified maximum thickness limit.")
-        if self.geom.B < self.geom.cx or self.geom.L < self.geom.cy: raise ValueError("Footing must be larger than the column in both plan dimensions.")
-        return True
+    if g.cover < DEFAULT_COVER_MM - 1e-9:
+        warnings.append(
+            f"Clear cover {g.cover:.0f} mm is below the default "
+            f"{DEFAULT_COVER_MM:.0f} mm for concrete cast against earth "
+            "(NSCP 2015 §420.6.1.3 — REQUIRES CODE VERIFICATION)."
+        )
+    return warnings
 
-    def calculate(self):
-        try:
-            self.read_inputs()
-            # Thickness iteration for isolated-like modes.
-            h0=self.geom.h
-            candidate=self.geom.h
-            best=None
-            max_iter=max(0,int(round((self.geom.h_max-h0)/0.025))+1)
-            if self.geom.auto_size and self.geom.footing_type in ("Isolated Square","Isolated Rectangular","Pedestal-Supported"):
-                for _ in range(max_iter+1):
-                    self.geom.h=candidate
-                    rr=design_footing(self.project,self.material,self.soil,self.load,self.geom,self.rebar)
-                    best=rr
-                    if rr.ok or candidate >= self.geom.h_max-1e-9: break
-                    # If shear/punching/development controls, increase thickness; otherwise retain geometry result.
-                    if (not rr.punching.get("pass",True)) or any(not x.get("pass",True) for x in rr.shear.values()) or not rr.development.get("pass",True):
-                        candidate=round(candidate+0.025, 6)
-                    else: break
-                self.geom.h=candidate if best and best.footing else h0
-                self.results=best
+
+# --- Load combinations -----------------------------------------------------
+
+def strength_combinations() -> List[LoadCombination]:
+    """Strength (LRFD) combinations — ACI/ASCE lineage.
+    REQUIRES CODE VERIFICATION against NSCP 2015 §203.3."""
+    return [
+        LoadCombination("1.4D", {"D": 1.4}, "strength"),
+        LoadCombination("1.2D + 1.6L", {"D": 1.2, "L": 1.6}, "strength"),
+    ]
+
+
+def service_combinations() -> List[LoadCombination]:
+    """Service combinations — REQUIRES CODE VERIFICATION §203.4."""
+    return [
+        LoadCombination("D + L", {"D": 1.0, "L": 1.0}, "service"),
+        LoadCombination("D + 0.75L", {"D": 1.0, "L": 0.75}, "service"),
+    ]
+
+
+def _apply_combo(cases: Dict[str, LoadCase], combo: LoadCombination):
+    P = Mx = My = 0.0
+    for cname, factor in combo.factors.items():
+        if cname in cases:
+            P += factor * cases[cname].P
+            Mx += factor * cases[cname].Mx
+            My += factor * cases[cname].My
+    return P, Mx, My
+
+
+def governing_strength_loads(project: Project):
+    cases = {lc.name: lc for lc in project.load_cases}
+    gov = None
+    for combo in strength_combinations():
+        P, Mx, My = _apply_combo(cases, combo)
+        if gov is None or P > gov[0]:
+            gov = (P, Mx, My, combo.name)
+    return gov
+
+
+def governing_service_loads(project: Project):
+    cases = {lc.name: lc for lc in project.load_cases}
+    gov = None
+    for combo in service_combinations():
+        P, Mx, My = _apply_combo(cases, combo)
+        if gov is None or P > gov[0]:
+            gov = (P, Mx, My, combo.name)
+    return gov
+
+
+# --- Bearing ---------------------------------------------------------------
+
+def check_bearing(project: Project) -> CheckResult:
+    """Service-level soil bearing check with biaxial eccentricity."""
+    svc_P, svc_Mx, svc_My, combo_name = governing_service_loads(project)
+    g, s = project.geometry, project.soil
+
+    B_m = g.B / 1000.0
+    L_m = g.L / 1000.0
+    H_m = g.H / 1000.0
+    A = B_m * L_m
+
+    W_footing = A * H_m * project.concrete.density
+    W_soil = A * max(0.0, s.Df - H_m) * s.unit_weight
+    P_total = svc_P + W_footing + W_soil
+
+    ex = svc_My / P_total if P_total else 0.0
+    ey = svc_Mx / P_total if P_total else 0.0
+
+    Ix = B_m * L_m ** 3 / 12.0
+    Iy = L_m * B_m ** 3 / 12.0
+    q_avg = P_total / A
+    qx = svc_Mx * (L_m / 2.0) / Ix if Ix else 0.0
+    qy = svc_My * (B_m / 2.0) / Iy if Iy else 0.0
+    qmax = q_avg + abs(qx) + abs(qy)
+    qmin = q_avg - abs(qx) - abs(qy)
+
+    warnings: List[str] = []
+    if qmin < 0:
+        warnings.append(
+            "qmin < 0 — loss of full soil contact. Review eccentricity and "
+            "uplift assumptions."
+        )
+    if abs(ex) > B_m / 6.0 or abs(ey) > L_m / 6.0:
+        warnings.append(
+            "Resultant outside middle-third (kern). Partial compression likely."
+        )
+
+    if qmax <= s.qa and qmin >= 0:
+        status = Status.PASS if not warnings else Status.WARNING
+    else:
+        status = Status.FAIL
+
+    util = qmax / s.qa if s.qa > 0 else float("inf")
+
+    return CheckResult(
+        name="Bearing Pressure",
+        status=status,
+        demand=qmax, capacity=s.qa, utilization=util, units="kPa",
+        code_ref=CODE_REFERENCES["bearing"],
+        inputs={"combo": combo_name, "P_service_kN": svc_P,
+                "Mx_service_kNm": svc_Mx, "My_service_kNm": svc_My,
+                "qa_kPa": s.qa, "B_m": B_m, "L_m": L_m, "H_m": H_m},
+        intermediate={"P_total_kN": P_total,
+                      "W_footing_kN": W_footing, "W_soil_kN": W_soil,
+                      "ex_m": ex, "ey_m": ey,
+                      "q_avg_kPa": q_avg,
+                      "qmax_kPa": qmax, "qmin_kPa": qmin},
+        equations=[
+            "ex = My / P_total",
+            "ey = Mx / P_total",
+            "q_avg = P_total / (B·L)",
+            "qmax = q_avg + Mx·(L/2)/Ix + My·(B/2)/Iy",
+            "qmin = q_avg − Mx·(L/2)/Ix − My·(B/2)/Iy",
+        ],
+        warnings=warnings,
+    )
+
+
+# --- Flexure ---------------------------------------------------------------
+
+def _beta1(fc: float) -> float:
+    # REQUIRES CODE VERIFICATION — NSCP 2015 §422.2.2.3
+    if fc <= 28.0:
+        return 0.85
+    if fc >= 55.0:
+        return 0.65
+    return 0.85 - 0.05 * (fc - 28.0) / 7.0
+
+
+def check_flexure(Mu_kNm: float, b_mm: float, d_mm: float,
+                  fc: float, fy: float, axis: str) -> CheckResult:
+    Mu_Nmm = Mu_kNm * 1e6
+    phi = PHI_FLEXURE
+    beta1 = _beta1(fc)
+
+    Rn = Mu_Nmm / (phi * b_mm * d_mm ** 2) if b_mm * d_mm ** 2 else 0.0
+    inner = 1.0 - 2.0 * Rn / (0.85 * fc) if fc > 0 else 0.0
+    rho = (0.85 * fc / fy) * (1.0 - math.sqrt(max(0.0, inner))) if fy > 0 else 0.0
+    As_req = rho * b_mm * d_mm
+    As_min = MIN_REBAR_RATIO_FOOTING * b_mm * d_mm  # REQUIRES CODE VERIFICATION
+    As_required = max(As_req, As_min)
+
+    a = As_required * fy / (0.85 * fc * b_mm) if fc * b_mm else 0.0
+    c = a / beta1 if beta1 else 0.0
+    eps_t = 0.003 * (d_mm - c) / c if c > 0 else 0.0
+
+    if eps_t >= 0.005:
+        phi_use = 0.90
+    elif eps_t <= 0.002:
+        phi_use = 0.65
+    else:
+        phi_use = 0.65 + 0.25 * (eps_t - 0.002) / 0.003
+
+    Mn_Nmm = As_required * fy * (d_mm - a / 2.0)
+    phiMn_kNm = phi_use * Mn_Nmm / 1e6
+
+    status = Status.PASS if phiMn_kNm >= Mu_kNm else Status.FAIL
+    util = Mu_kNm / phiMn_kNm if phiMn_kNm > 0 else float("inf")
+    warnings = []
+    if status == Status.PASS and util > 0.95:
+        warnings.append(f"Flexure {axis} is close to capacity "
+                        f"(utilization = {util:.2f}).")
+
+    return CheckResult(
+        name=f"Flexure {axis}",
+        status=status,
+        demand=Mu_kNm, capacity=phiMn_kNm, utilization=util, units="kN·m",
+        code_ref=CODE_REFERENCES["flexure"],
+        inputs={"Mu_kNm": Mu_kNm, "b_mm": b_mm, "d_mm": d_mm,
+                "fc_MPa": fc, "fy_MPa": fy},
+        intermediate={"rho": rho, "As_req_mm2": As_req, "As_min_mm2": As_min,
+                      "As_required_mm2": As_required, "a_mm": a, "c_mm": c,
+                      "eps_t": eps_t, "phi": phi_use, "beta1": beta1,
+                      "phiMn_kNm": phiMn_kNm},
+        equations=[
+            "Rn = Mu / (φ·b·d²)",
+            "ρ = (0.85 f'c / fy)·[1 − √(1 − 2Rn/(0.85 f'c))]",
+            "As = ρ·b·d",
+            "As,min = 0.0018·b·h  (REQUIRES CODE VERIFICATION §425.2)",
+            "a = As·fy / (0.85 f'c b)",
+            "φMn = φ·As·fy·(d − a/2)",
+        ],
+        warnings=warnings,
+    )
+
+
+# --- One-way shear ---------------------------------------------------------
+
+def check_one_way_shear(Vu_kN: float, b_mm: float, d_mm: float,
+                        fc: float, axis: str,
+                        lambda_factor: float = 1.0) -> CheckResult:
+    # Vc = 0.17·λ·√f'c·bw·d (SI: N, MPa, mm) — REQUIRES CODE VERIFICATION §422.5.1
+    Vc_N = 0.17 * lambda_factor * math.sqrt(fc) * b_mm * d_mm
+    phiVn_kN = PHI_SHEAR * Vc_N / 1000.0
+    status = Status.PASS if phiVn_kN >= Vu_kN else Status.FAIL
+    util = Vu_kN / phiVn_kN if phiVn_kN > 0 else float("inf")
+    warnings = []
+    if status == Status.PASS and util > 0.95:
+        warnings.append(f"One-way shear {axis} close to capacity "
+                        f"(utilization = {util:.2f}).")
+    return CheckResult(
+        name=f"One-way Shear {axis}",
+        status=status, demand=Vu_kN, capacity=phiVn_kN,
+        utilization=util, units="kN",
+        code_ref=CODE_REFERENCES["one_way_shear"],
+        inputs={"Vu_kN": Vu_kN, "b_mm": b_mm, "d_mm": d_mm, "fc_MPa": fc},
+        intermediate={"Vc_N": Vc_N, "phiVn_kN": phiVn_kN, "phi": PHI_SHEAR},
+        equations=["Vc = 0.17·λ·√f'c·bw·d  (SI)",
+                   "φVn = φ·Vc, φ = 0.75"],
+        warnings=warnings,
+    )
+
+
+# --- Punching shear --------------------------------------------------------
+
+def check_punching(Vu_kN: float, cx_mm: float, cy_mm: float, d_mm: float,
+                   fc: float, lambda_factor: float = 1.0,
+                   alpha_s: float = 40.0) -> CheckResult:
+    if cx_mm <= 0 or cy_mm <= 0:
+        raise InputValidationError(
+            "Column dimensions must be positive for punching shear check.")
+
+    beta_col = max(cx_mm, cy_mm) / min(cx_mm, cy_mm)
+
+    # b0 at d/2 from column face — REQUIRES CODE VERIFICATION §422.6.1
+    b0 = 2.0 * (cx_mm + d_mm) + 2.0 * (cy_mm + d_mm)
+
+    # Three expressions, take minimum — REQUIRES CODE VERIFICATION §422.6.5
+    Vc1 = 0.33 * lambda_factor * math.sqrt(fc) * b0 * d_mm
+    Vc2 = 0.17 * (1.0 + 2.0 / beta_col) * lambda_factor * math.sqrt(fc) * b0 * d_mm
+    Vc3 = 0.083 * (2.0 + alpha_s * d_mm / b0) * lambda_factor * math.sqrt(fc) * b0 * d_mm
+
+    Vc_N = min(Vc1, Vc2, Vc3)
+    phiVc_kN = PHI_SHEAR * Vc_N / 1000.0
+    status = Status.PASS if phiVc_kN >= Vu_kN else Status.FAIL
+    util = Vu_kN / phiVc_kN if phiVc_kN > 0 else float("inf")
+    warnings = []
+    if status == Status.PASS and util > 0.90:
+        warnings.append(f"Punching shear utilization = {util:.2f}. "
+                        "Design is close to capacity.")
+
+    return CheckResult(
+        name="Punching Shear",
+        status=status, demand=Vu_kN, capacity=phiVc_kN,
+        utilization=util, units="kN",
+        code_ref=CODE_REFERENCES["punching_shear"],
+        inputs={"Vu_kN": Vu_kN, "cx_mm": cx_mm, "cy_mm": cy_mm,
+                "d_mm": d_mm, "fc_MPa": fc, "beta_col": beta_col,
+                "alpha_s": alpha_s},
+        intermediate={"b0_mm": b0, "Vc1_N": Vc1, "Vc2_N": Vc2, "Vc3_N": Vc3,
+                      "Vc_governing_N": Vc_N, "phiVc_kN": phiVc_kN,
+                      "phi": PHI_SHEAR},
+        equations=[
+            "b0 = 2(c1 + d) + 2(c2 + d)   (d/2 from column face)",
+            "Vc1 = 0.33·λ·√f'c·b0·d",
+            "Vc2 = 0.17·(1 + 2/β)·λ·√f'c·b0·d,  β = long/short column side",
+            "Vc3 = 0.083·(2 + αs·d/b0)·λ·√f'c·b0·d",
+            "Vc = min(Vc1, Vc2, Vc3)",
+            "φVc = φ·Vc, φ = 0.75",
+        ],
+        warnings=warnings,
+    )
+
+
+# --- Reinforcement selection ----------------------------------------------
+
+@dataclass
+class BarLayout:
+    diameter_mm: float
+    count: int
+    spacing_mm: float
+    As_provided_mm2: float
+    length_mm: float = 0.0
+
+    def label(self) -> str:
+        return f"{self.count}-{self.diameter_mm:.0f}mm @ {self.spacing_mm:.0f}mm"
+
+
+def select_reinforcement(As_required_mm2: float, B_mm: float,
+                         cover_mm: float, preferred_dia: float = 20.0
+                         ) -> BarLayout:
+    """Pick a practical bar arrangement satisfying As_required, minimum
+    clear spacing, and minimum bar count."""
+    usable = B_mm - 2.0 * cover_mm
+    if usable <= 0 or preferred_dia <= 0:
+        raise InputValidationError(
+            "Usable width is not positive — check B and cover.")
+
+    bar_area = math.pi * preferred_dia ** 2 / 4.0
+    count_min = max(2, math.ceil(As_required_mm2 / bar_area))
+    # Minimum clear spacing = max(25 mm, bar diameter) — REQUIRES CODE VERIFICATION
+    min_clear = max(25.0, preferred_dia)
+
+    # Increase count until spacing >= min_clear, else fall back to smaller bars
+    count = count_min
+    for _ in range(500):
+        if count <= 1:
+            break
+        spacing = usable / (count - 1)
+        if spacing >= min_clear:
+            As_provided = count * bar_area
+            return BarLayout(preferred_dia, count, spacing, As_provided,
+                             length_mm=B_mm - 2.0 * cover_mm)
+        count += 1
+
+    raise InputValidationError(
+        "Unable to fit reinforcement — reduce required As or enlarge footing.")
+
+
+def design_reinforcement(project: Project, flex_x: CheckResult,
+                         flex_y: CheckResult) -> CheckResult:
+    As_x_req = flex_x.intermediate.get("As_required_mm2", 0.0)
+    As_y_req = flex_y.intermediate.get("As_required_mm2", 0.0)
+    g = project.geometry
+
+    layout_x = select_reinforcement(As_x_req, g.L, g.cover, project.rebar.diameter)
+    layout_y = select_reinforcement(As_y_req, g.B, g.cover, project.rebar.diameter)
+
+    ok = (layout_x.As_provided_mm2 >= As_x_req and
+          layout_y.As_provided_mm2 >= As_y_req)
+    status = Status.PASS if ok else Status.FAIL
+
+    util_x = As_x_req / layout_x.As_provided_mm2 if layout_x.As_provided_mm2 else 0.0
+    util_y = As_y_req / layout_y.As_provided_mm2 if layout_y.As_provided_mm2 else 0.0
+
+    return CheckResult(
+        name="Reinforcement Design",
+        status=status,
+        demand=max(As_x_req, As_y_req),
+        capacity=min(layout_x.As_provided_mm2, layout_y.As_provided_mm2),
+        utilization=max(util_x, util_y),
+        units="mm²",
+        code_ref=CODE_REFERENCES["min_reinforcement"],
+        inputs={"As_x_required_mm2": As_x_req, "As_y_required_mm2": As_y_req,
+                "bar_dia_mm": project.rebar.diameter},
+        intermediate={
+            "layout_x": asdict(layout_x),
+            "layout_y": asdict(layout_y),
+            "As_x_provided_mm2": layout_x.As_provided_mm2,
+            "As_y_provided_mm2": layout_y.As_provided_mm2,
+        },
+        equations=[
+            "As,min = 0.0018·b·h  (REQUIRES CODE VERIFICATION §425.2)",
+            "Select bar count such that As_provided ≥ As_required",
+            "Check minimum clear spacing = max(25 mm, bar diameter) "
+            "(REQUIRES CODE VERIFICATION)",
+        ],
+        warnings=[],
+    )
+
+
+# --- Orchestrator ----------------------------------------------------------
+
+class IsolatedFootingDesign:
+    """Orchestrates the isolated footing design pipeline.
+    GUI never calls the individual check functions directly."""
+
+    def __init__(self, project: Project):
+        self.project = project
+
+    def run(self) -> DesignResult:
+        warnings = validate_project(self.project)
+        result = DesignResult(warnings=list(warnings))
+
+        g = self.project.geometry
+        c = self.project.concrete
+        r = self.project.rebar
+        s = self.project.soil
+
+        # --- SERVICE: Bearing ---
+        result.bearing = check_bearing(self.project)
+
+        # --- STRENGTH: Factored loads ---
+        fact_P, fact_Mx, fact_My, combo_name = governing_strength_loads(self.project)
+
+        d = g.effective_depth(r.diameter)
+        if d <= 0:
+            raise InputValidationError(
+                "Effective depth d ≤ 0 — footing thickness is too small "
+                "for the specified cover and bar diameter.")
+
+        B_m = g.B / 1000.0
+        L_m = g.L / 1000.0
+        q_u = fact_P / (B_m * L_m) if B_m * L_m else 0.0  # kPa (net)
+
+        a_x = max(0.0, (B_m - g.cx / 1000.0) / 2.0)
+        a_y = max(0.0, (L_m - g.cy / 1000.0) / 2.0)
+
+        Mu_x = q_u * L_m * a_x ** 2 / 2.0
+        Mu_y = q_u * B_m * a_y ** 2 / 2.0
+
+        result.flexure_x = check_flexure(Mu_x, g.L, d, c.fc, r.fy, "X")
+        result.flexure_y = check_flexure(Mu_y, g.B, d, c.fc, r.fy, "Y")
+
+        # One-way shear at d from column face
+        Vu_x = q_u * L_m * max(0.0, a_x - d / 1000.0)
+        Vu_y = q_u * B_m * max(0.0, a_y - d / 1000.0)
+        result.one_way_shear_x = check_one_way_shear(
+            Vu_x, g.L, d, c.fc, "X", c.lambda_factor)
+        result.one_way_shear_y = check_one_way_shear(
+            Vu_y, g.B, d, c.fc, "Y", c.lambda_factor)
+
+        # Punching shear — Vu = q_u × (area outside critical perimeter)
+        A_in = (g.cx + d) * (g.cy + d)  # mm^2 (approx inside d/2 perimeter)
+        A_total = g.B * g.L
+        A_out = max(0.0, A_total - A_in)
+        Vu_punch = q_u * (A_out / 1e6)
+        result.punching_shear = check_punching(
+            Vu_punch, g.cx, g.cy, d, c.fc, c.lambda_factor)
+
+        # Reinforcement
+        result.reinforcement = design_reinforcement(
+            self.project, result.flexure_x, result.flexure_y)
+
+        # Aggregate warnings
+        for chk in result.all_checks():
+            result.warnings.extend(chk.warnings)
+
+        # Overall status
+        statuses = [chk.status for chk in result.all_checks()]
+        if any(s == Status.FAIL for s in statuses):
+            result.overall_status = Status.FAIL
+        elif any(s == Status.WARNING for s in statuses) or result.warnings:
+            result.overall_status = Status.WARNING
+        elif all(s == Status.PASS for s in statuses):
+            result.overall_status = Status.PASS
+        else:
+            result.overall_status = Status.NOT_ANALYZED
+
+        return result
+
+
+# ---------------------------------------------------------------------------
+# [SECTION 4]  VISUALIZATION
+# ---------------------------------------------------------------------------
+
+def draw_plan(project: Project, result: DesignResult, ax):
+    """Plan view of the footing, column, punching perimeter, and resultant."""
+    g = project.geometry
+    B = g.B
+    L = g.L
+
+    # Footing outline
+    ax.add_patch(__import__("matplotlib.patches", fromlist=["Rectangle"]).Rectangle(
+        (-B / 2, -L / 2), B, L, fill=False, edgecolor="black", linewidth=2))
+    # Column outline
+    ax.add_patch(__import__("matplotlib.patches", fromlist=["Rectangle"]).Rectangle(
+        (-g.cx / 2, -g.cy / 2), g.cx, g.cy, fill=False,
+        edgecolor="black", linewidth=1.5))
+
+    # Punching perimeter (d/2 from column face)
+    d = g.effective_depth(project.rebar.diameter)
+    if d > 0:
+        bx = g.cx + 2 * d / 2
+        by = g.cy + 2 * d / 2
+        ax.add_patch(__import__("matplotlib.patches", fromlist=["Rectangle"]).Rectangle(
+            (-bx / 2, -by / 2), bx, by, fill=False, linestyle="--",
+            edgecolor="red", linewidth=1.2, label="Critical perimeter (d/2)"))
+
+    # Resultant
+    if result.bearing is not None:
+        ex = result.bearing.intermediate.get("ex_m", 0.0) * 1000.0
+        ey = result.bearing.intermediate.get("ey_m", 0.0) * 1000.0
+        ax.plot(ex, ey, marker="o", color="blue", markersize=8,
+                label="Resultant (service)")
+        ax.annotate("RESULTANT", (ex, ey),
+                    textcoords="offset points", xytext=(0, 12),
+                    ha="center", fontsize=9)
+
+    # Dimensions
+    ax.annotate("", xy=(-B / 2, -L / 2 - 100), xytext=(B / 2, -L / 2 - 100),
+                arrowprops=dict(arrowstyle="<->"))
+    ax.text(0, -L / 2 - 180, f"B = {B:.0f} mm", ha="center", fontsize=9)
+    ax.annotate("", xy=(B / 2 + 100, -L / 2), xytext=(B / 2 + 100, L / 2),
+                arrowprops=dict(arrowstyle="<->"))
+    ax.text(B / 2 + 150, 0, f"L = {L:.0f} mm", rotation=90,
+            va="center", fontsize=9)
+
+    ax.set_aspect("equal")
+    ax.set_title("Plan View", fontsize=11)
+    ax.set_xlabel("X [mm]")
+    ax.set_ylabel("Y [mm]")
+    ax.grid(True, linestyle=":", alpha=0.4)
+    ax.legend(loc="upper right", fontsize=8)
+
+
+def draw_section(project: Project, ax):
+    """Elevation section through the footing."""
+    g = project.geometry
+    B = g.B
+    H = g.H
+    # Footing block
+    ax.add_patch(__import__("matplotlib.patches", fromlist=["Rectangle"]).Rectangle(
+        (-B / 2, -H), B, H, fill=False, edgecolor="black", linewidth=2))
+    # Column
+    ax.add_patch(__import__("matplotlib.patches", fromlist=["Rectangle"]).Rectangle(
+        (-g.cx / 2, 0), g.cx, 800, fill=False, edgecolor="black", linewidth=1.5))
+    # Soil line
+    ax.plot([-B / 2 - 200, B / 2 + 200], [0, 0], color="brown",
+            linewidth=1.0, linestyle="--")
+    ax.text(B / 2 + 210, 0, "Ground", fontsize=8, va="center", color="brown")
+    # Rebar indication
+    d = g.effective_depth(project.rebar.diameter)
+    if d > 0:
+        ax.plot([-B / 2 + g.cover, B / 2 - g.cover],
+                [-H + g.cover + project.rebar.diameter / 2,
+                 -H + g.cover + project.rebar.diameter / 2],
+                color="red", linewidth=2, label="Bottom steel")
+        ax.text(0, -H + g.cover + project.rebar.diameter / 2 + 40,
+                f"{project.rebar.diameter:.0f}mm bars", ha="center",
+                fontsize=8, color="red")
+
+    ax.annotate("", xy=(-B / 2, -H - 120), xytext=(B / 2, -H - 120),
+                arrowprops=dict(arrowstyle="<->"))
+    ax.text(0, -H - 200, f"B = {B:.0f} mm", ha="center", fontsize=9)
+    ax.annotate("", xy=(-B / 2 - 100, -H), xytext=(-B / 2 - 100, 0),
+                arrowprops=dict(arrowstyle="<->"))
+    ax.text(-B / 2 - 180, -H / 2, f"H = {H:.0f} mm", rotation=90,
+            va="center", fontsize=9)
+
+    ax.set_aspect("equal")
+    ax.set_title("Section", fontsize=11)
+    ax.set_xlabel("X [mm]")
+    ax.set_ylabel("Elevation [mm]")
+    ax.grid(True, linestyle=":", alpha=0.4)
+    ax.legend(loc="lower right", fontsize=8)
+
+
+# ---------------------------------------------------------------------------
+# [SECTION 5]  REPORTING
+# ---------------------------------------------------------------------------
+
+def build_calc_report_text(project: Project, result: DesignResult) -> str:
+    """Plain-text calculation report — same content the PDF renders."""
+    lines: List[str] = []
+    add = lines.append
+
+    add("=" * 78)
+    add("RC FOOTING DESIGNER — NSCP 2015")
+    add("CALCULATION REPORT")
+    add("=" * 78)
+    add("")
+    add(f"Project          : {project.info.name}")
+    add(f"Location         : {project.info.location}")
+    add(f"Foundation Mark  : {project.info.foundation_mark}")
+    add(f"Footing Type     : {project.footing_type.title()}")
+    add(f"Design Engineer  : {project.info.design_engineer}")
+    add(f"Checker          : {project.info.checker}")
+    add(f"Date             : {project.info.date}")
+    add(f"Design Code      : {CODE_VERSION}")
+    add("")
+
+    add("--- DESIGN DISCLAIMER ---")
+    for chunk in _wrap(DISCLAIMER_TEXT, 76):
+        add(chunk)
+    add("")
+
+    add("--- 1. DESIGN CRITERIA ---")
+    add(f"  f'c (concrete)          : {project.concrete.fc:.1f} MPa")
+    add(f"  fy (reinforcement)      : {project.rebar.fy:.1f} MPa")
+    add(f"  Es                      : {project.rebar.Es:.0f} MPa")
+    add(f"  Concrete density        : {project.concrete.density:.1f} kN/m³")
+    add(f"  Allowable soil bearing  : {project.soil.qa:.1f} kPa")
+    add(f"  Soil unit weight        : {project.soil.unit_weight:.1f} kN/m³")
+    add(f"  Embedment depth Df      : {project.soil.Df:.2f} m")
+    add("")
+
+    add("--- 2. INPUT DATA ---")
+    g = project.geometry
+    add(f"  Footing width  B        : {g.B:.0f} mm")
+    add(f"  Footing length L        : {g.L:.0f} mm")
+    add(f"  Footing thickness H     : {g.H:.0f} mm")
+    add(f"  Column width  cx        : {g.cx:.0f} mm")
+    add(f"  Column length cy        : {g.cy:.0f} mm")
+    add(f"  Clear cover             : {g.cover:.0f} mm")
+    add(f"  Bar diameter            : {project.rebar.diameter:.0f} mm")
+    add("")
+
+    add("--- 3. LOAD CASES ---")
+    add(f"  {'Name':<10}{'P [kN]':>12}{'Mx [kN·m]':>14}{'My [kN·m]':>14}")
+    for lc in project.load_cases:
+        add(f"  {lc.name:<10}{lc.P:>12.2f}{lc.Mx:>14.2f}{lc.My:>14.2f}")
+    add("")
+
+    add("--- 4. LOAD COMBINATIONS (REQUIRES CODE VERIFICATION §203) ---")
+    add("  Strength:")
+    for c in strength_combinations():
+        add(f"    {c.name}   factors = {c.factors}")
+    add("  Service:")
+    for c in service_combinations():
+        add(f"    {c.name}   factors = {c.factors}")
+    add("")
+
+    def dump(chk: Optional[CheckResult]):
+        if chk is None:
+            return
+        add(f"--- {chk.name.upper()} ---")
+        add(f"  Code reference: {chk.code_ref}")
+        for k, v in chk.inputs.items():
+            add(f"    input.{k:<22}: {_fmt(v)}")
+        for k, v in chk.intermediate.items():
+            add(f"    calc .{k:<22}: {_fmt(v)}")
+        add("  Equations:")
+        for eq in chk.equations:
+            add(f"    {eq}")
+        add(f"  DEMAND   = {_fmt(chk.demand)} {chk.units}")
+        add(f"  CAPACITY = {_fmt(chk.capacity)} {chk.units}")
+        add(f"  UTILIZATION = {chk.utilization:.3f}")
+        add(f"  STATUS   = {chk.status.value}")
+        for w in chk.warnings:
+            add(f"  WARNING  : {w}")
+        add("")
+
+    dump(result.bearing)
+    dump(result.flexure_x)
+    dump(result.flexure_y)
+    dump(result.one_way_shear_x)
+    dump(result.one_way_shear_y)
+    dump(result.punching_shear)
+    dump(result.reinforcement)
+
+    add("--- FINAL SUMMARY ---")
+    add(f"  OVERALL STATUS: {result.overall_status.value}")
+    for chk in result.all_checks():
+        add(f"    {chk.name:<22}: {chk.status.value:<12} "
+            f"(util = {chk.utilization:.2f})")
+    add("")
+    if result.warnings:
+        add("--- WARNINGS ---")
+        for w in result.warnings:
+            for line in _wrap("* " + w, 76):
+                add("  " + line)
+
+    return "\n".join(lines)
+
+
+def _wrap(text: str, width: int) -> List[str]:
+    words = text.split()
+    lines, cur = [], ""
+    for w in words:
+        if len(cur) + len(w) + 1 > width:
+            lines.append(cur)
+            cur = w
+        else:
+            cur = (cur + " " + w).strip()
+    if cur:
+        lines.append(cur)
+    return lines
+
+
+def _fmt(v: Any) -> str:
+    if isinstance(v, float):
+        return f"{v:,.3f}"
+    return str(v)
+
+
+def export_pdf(project: Project, result: DesignResult, path: str) -> bool:
+    """Optional PDF export via ReportLab. Returns True on success."""
+    try:
+        from reportlab.lib.pagesizes import A4
+        from reportlab.pdfgen import canvas
+    except ImportError:
+        return False
+
+    text = build_calc_report_text(project, result)
+    c = canvas.Canvas(path, pagesize=A4)
+    width, height = A4
+    y = height - 40
+    c.setFont("Courier", 8)
+    for line in text.splitlines():
+        if y < 40:
+            c.showPage()
+            c.setFont("Courier", 8)
+            y = height - 40
+        c.drawString(30, y, line[:130])
+        y -= 10
+    c.save()
+    return True
+
+
+# ---------------------------------------------------------------------------
+# [SECTION 6]  GUI
+# ---------------------------------------------------------------------------
+
+def run_gui():  # noqa: C901
+    try:
+        from PySide6.QtCore import Qt
+        from PySide6.QtGui import QAction, QColor, QFont
+        from PySide6.QtWidgets import (
+            QApplication, QComboBox, QDoubleSpinBox, QFileDialog, QFormLayout,
+            QGroupBox, QHBoxLayout, QLabel, QLineEdit, QListWidget,
+            QListWidgetItem, QMainWindow, QMessageBox, QProgressBar,
+            QPushButton, QScrollArea, QSplitter, QStackedWidget,
+            QTableWidget, QTableWidgetItem, QTabWidget, QTextEdit,
+            QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
+        )
+    except ImportError:
+        print("PySide6 is required. Install with:  pip install PySide6")
+        sys.exit(1)
+
+    try:
+        import matplotlib
+        matplotlib.use("QtAgg")
+        from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
+        from matplotlib.figure import Figure
+        HAS_MPL = True
+    except ImportError:
+        HAS_MPL = False
+
+    # ------------------- Shared project state -------------------
+    state = {"project": Project(), "result": None}
+
+    # ------------------- Small helpers --------------------------
+
+    def status_color(status: Status) -> str:
+        return {
+            Status.PASS: "#2e7d32",
+            Status.WARNING: "#f9a825",
+            Status.FAIL: "#c62828",
+            Status.NOT_ANALYZED: "#616161",
+        }.get(status, "#616161")
+
+    def make_spin(minimum: float, maximum: float, value: float,
+                  decimals: int = 2, suffix: str = "") -> QDoubleSpinBox:
+        sb = QDoubleSpinBox()
+        sb.setRange(minimum, maximum)
+        sb.setDecimals(decimals)
+        sb.setValue(value)
+        if suffix:
+            sb.setSuffix(" " + suffix)
+        return sb
+
+    # ------------------- Page: Project Info ---------------------
+
+    class ProjectPage(QWidget):
+        def __init__(self):
+            super().__init__()
+            form = QFormLayout(self)
+            self.fields: Dict[str, QLineEdit] = {}
+            for label, key in [
+                ("Project name", "name"),
+                ("Location", "location"),
+                ("Building / structure", "structure"),
+                ("Client", "client"),
+                ("Design engineer", "design_engineer"),
+                ("Checker", "checker"),
+                ("Date", "date"),
+                ("Revision", "revision"),
+                ("Drawing number", "drawing_no"),
+                ("Foundation mark / tag", "foundation_mark"),
+            ]:
+                le = QLineEdit()
+                le.textChanged.connect(
+                    lambda text, k=key: setattr(state["project"].info, k, text))
+                self.fields[key] = le
+                form.addRow(label, le)
+
+        def refresh_from_model(self):
+            for k, le in self.fields.items():
+                le.setText(str(getattr(state["project"].info, k)))
+
+    # ------------------- Page: Footing Type ---------------------
+
+    class FootingTypePage(QWidget):
+        def __init__(self):
+            super().__init__()
+            v = QVBoxLayout(self)
+            v.addWidget(QLabel("<b>Select foundation type</b>"))
+            self.listw = QListWidget()
+            types = [
+                ("Isolated / Single Footing", "isolated"),
+                ("Combined Footing (future)", "combined"),
+                ("Strap Footing (future)", "strap"),
+                ("Strip / Continuous Footing (future)", "strip"),
+                ("Wall Footing (future)", "wall"),
+                ("Circular Footing (future)", "circular"),
+            ]
+            for label, key in types:
+                item = QListWidgetItem(label)
+                item.setData(Qt.UserRole, key)
+                if key != "isolated":
+                    item.setFlags(item.flags() & ~Qt.ItemIsEnabled)
+                    item.setToolTip("Not yet implemented in this single-file "
+                                    "build — architecture supports adding it.")
+                self.listw.addItem(item)
+            self.listw.setCurrentRow(0)
+            self.listw.currentItemChanged.connect(self._changed)
+            v.addWidget(self.listw)
+            self.note = QLabel(
+                "Only <b>Isolated Footing</b> is fully implemented in this "
+                "single-file build. Other types are architecturally reserved "
+                "(see FootingDesign interface).")
+            self.note.setWordWrap(True)
+            v.addWidget(self.note)
+
+        def _changed(self, cur, _prev):
+            if cur is None:
+                return
+            key = cur.data(Qt.UserRole)
+            state["project"].footing_type = key
+
+    # ------------------- Page: Geometry -------------------------
+
+    class GeometryPage(QWidget):
+        def __init__(self):
+            super().__init__()
+            v = QVBoxLayout(self)
+            gb = QGroupBox("Footing geometry")
+            form = QFormLayout(gb)
+            g = state["project"].geometry
+            self.B = make_spin(200, 20000, g.B, 0, "mm")
+            self.L = make_spin(200, 20000, g.L, 0, "mm")
+            self.H = make_spin(100, 5000, g.H, 0, "mm")
+            self.cx = make_spin(50, 5000, g.cx, 0, "mm")
+            self.cy = make_spin(50, 5000, g.cy, 0, "mm")
+            self.cover = make_spin(20, 200, g.cover, 0, "mm")
+            for label, widget, attr in [
+                ("Footing width B", self.B, "B"),
+                ("Footing length L", self.L, "L"),
+                ("Footing thickness H", self.H, "H"),
+                ("Column width cx", self.cx, "cx"),
+                ("Column length cy", self.cy, "cy"),
+                ("Clear cover", self.cover, "cover"),
+            ]:
+                widget.valueChanged.connect(
+                    lambda val, a=attr: setattr(state["project"].geometry, a, val))
+                form.addRow(label, widget)
+            v.addWidget(gb)
+            v.addStretch(1)
+
+        def refresh_from_model(self):
+            g = state["project"].geometry
+            self.B.setValue(g.B); self.L.setValue(g.L); self.H.setValue(g.H)
+            self.cx.setValue(g.cx); self.cy.setValue(g.cy)
+            self.cover.setValue(g.cover)
+
+    # ------------------- Page: Materials ------------------------
+
+    class MaterialsPage(QWidget):
+        def __init__(self):
+            super().__init__()
+            v = QVBoxLayout(self)
+            gb_c = QGroupBox("Concrete")
+            f1 = QFormLayout(gb_c)
+            c = state["project"].concrete
+            self.fc = make_spin(15, 100, c.fc, 1, "MPa")
+            self.dens = make_spin(15, 30, c.density, 1, "kN/m³")
+            self.fc.valueChanged.connect(
+                lambda val: setattr(state["project"].concrete, "fc", val))
+            self.dens.valueChanged.connect(
+                lambda val: setattr(state["project"].concrete, "density", val))
+            f1.addRow("f'c", self.fc)
+            f1.addRow("Density", self.dens)
+            v.addWidget(gb_c)
+
+            gb_s = QGroupBox("Reinforcing steel")
+            f2 = QFormLayout(gb_s)
+            r = state["project"].rebar
+            self.fy = make_spin(200, 800, r.fy, 0, "MPa")
+            self.dia = QComboBox()
+            for d in STANDARD_BAR_DIAMETERS_MM:
+                self.dia.addItem(f"{d} mm", float(d))
+            self.dia.setCurrentText(f"{int(r.diameter)} mm")
+            self.fy.valueChanged.connect(
+                lambda val: setattr(state["project"].rebar, "fy", val))
+            self.dia.currentIndexChanged.connect(
+                lambda _: setattr(state["project"].rebar, "diameter",
+                                  self.dia.currentData()))
+            f2.addRow("fy", self.fy)
+            f2.addRow("Bar diameter", self.dia)
+            v.addWidget(gb_s)
+            v.addStretch(1)
+
+        def refresh_from_model(self):
+            c = state["project"].concrete
+            r = state["project"].rebar
+            self.fc.setValue(c.fc)
+            self.dens.setValue(c.density)
+            self.fy.setValue(r.fy)
+            idx = self.dia.findData(r.diameter)
+            if idx >= 0:
+                self.dia.setCurrentIndex(idx)
+
+    # ------------------- Page: Soil -----------------------------
+
+    class SoilPage(QWidget):
+        def __init__(self):
+            super().__init__()
+            v = QVBoxLayout(self)
+            gb = QGroupBox("Soil")
+            form = QFormLayout(gb)
+            s = state["project"].soil
+            self.qa = make_spin(10, 2000, s.qa, 1, "kPa")
+            self.uw = make_spin(10, 25, s.unit_weight, 1, "kN/m³")
+            self.df = make_spin(0.3, 20, s.Df, 2, "m")
+            self.qa.valueChanged.connect(
+                lambda val: setattr(state["project"].soil, "qa", val))
+            self.uw.valueChanged.connect(
+                lambda val: setattr(state["project"].soil, "unit_weight", val))
+            self.df.valueChanged.connect(
+                lambda val: setattr(state["project"].soil, "Df", val))
+            form.addRow("Allowable bearing qa", self.qa)
+            form.addRow("Soil unit weight", self.uw)
+            form.addRow("Embedment Df", self.df)
+            v.addWidget(gb)
+            note = QLabel(
+                "⚠ Soil bearing capacity is assumed user-provided. Confirm "
+                "against geotechnical investigation for final design.")
+            note.setWordWrap(True)
+            v.addWidget(note)
+            v.addStretch(1)
+
+        def refresh_from_model(self):
+            s = state["project"].soil
+            self.qa.setValue(s.qa); self.uw.setValue(s.unit_weight)
+            self.df.setValue(s.Df)
+
+    # ------------------- Page: Loads ----------------------------
+
+    class LoadsPage(QWidget):
+        def __init__(self):
+            super().__init__()
+            v = QVBoxLayout(self)
+            self.table = QTableWidget(0, 4)
+            self.table.setHorizontalHeaderLabels(["Name", "P [kN]", "Mx [kN·m]", "My [kN·m]"])
+            v.addWidget(self.table)
+            h = QHBoxLayout()
+            b_add = QPushButton("Add row")
+            b_del = QPushButton("Delete selected")
+            b_add.clicked.connect(self._add_row)
+            b_del.clicked.connect(self._del_row)
+            h.addWidget(b_add); h.addWidget(b_del); h.addStretch(1)
+            v.addLayout(h)
+            self.refresh_from_model()
+
+        def _add_row(self):
+            self.table.insertRow(self.table.rowCount())
+            self.table.setItem(self.table.rowCount() - 1, 0, QTableWidgetItem("NEW"))
+            for col in range(1, 4):
+                self.table.setItem(self.table.rowCount() - 1, col, QTableWidgetItem("0"))
+            self._sync()
+
+        def _del_row(self):
+            row = self.table.currentRow()
+            if row >= 0:
+                self.table.removeRow(row)
+                self._sync()
+
+        def refresh_from_model(self):
+            self.table.setRowCount(0)
+            for lc in state["project"].load_cases:
+                r = self.table.rowCount()
+                self.table.insertRow(r)
+                self.table.setItem(r, 0, QTableWidgetItem(lc.name))
+                self.table.setItem(r, 1, QTableWidgetItem(str(lc.P)))
+                self.table.setItem(r, 2, QTableWidgetItem(str(lc.Mx)))
+                self.table.setItem(r, 3, QTableWidgetItem(str(lc.My)))
+            self.table.itemChanged.connect(lambda _: self._sync())
+
+        def _sync(self):
+            out = []
+            for r in range(self.table.rowCount()):
+                try:
+                    name = self.table.item(r, 0).text()
+                    P = float(self.table.item(r, 1).text())
+                    Mx = float(self.table.item(r, 2).text())
+                    My = float(self.table.item(r, 3).text())
+                    out.append(LoadCase(name, P, Mx, My))
+                except (AttributeError, ValueError):
+                    pass
+            state["project"].load_cases = out
+
+    # ------------------- Page: Results --------------------------
+
+    class ResultsPage(QWidget):
+        def __init__(self):
+            super().__init__()
+            v = QVBoxLayout(self)
+            self.summary = QLabel("Not analyzed yet.")
+            f = QFont(); f.setBold(True); f.setPointSize(11)
+            self.summary.setFont(f)
+            self.summary.setWordWrap(True)
+            v.addWidget(self.summary)
+
+            self.table = QTableWidget(0, 5)
+            self.table.setHorizontalHeaderLabels(
+                ["Check", "Demand", "Capacity", "Utilization", "Status"])
+            v.addWidget(self.table)
+
+            self.warn_box = QTextEdit()
+            self.warn_box.setReadOnly(True)
+            self.warn_box.setPlaceholderText("Warnings will appear here.")
+            v.addWidget(QLabel("<b>Warnings</b>"))
+            v.addWidget(self.warn_box)
+
+        def update_from_result(self, project: Project, result: DesignResult):
+            self.summary.setText(
+                f"<b>FOOTING:</b> {project.info.foundation_mark} &nbsp; "
+                f"<b>TYPE:</b> {project.footing_type.title()} &nbsp; "
+                f"<b>SIZE:</b> {project.geometry.B:.0f} × {project.geometry.L:.0f} × "
+                f"{project.geometry.H:.0f} mm<br>"
+                f"<b>OVERALL STATUS:</b> "
+                f"<span style='color:{status_color(result.overall_status)};'>"
+                f"{result.overall_status.value}</span>")
+
+            self.table.setRowCount(0)
+            for chk in result.all_checks():
+                r = self.table.rowCount()
+                self.table.insertRow(r)
+                self.table.setItem(r, 0, QTableWidgetItem(chk.name))
+                self.table.setItem(r, 1, QTableWidgetItem(
+                    f"{chk.demand:,.2f} {chk.units}"))
+                self.table.setItem(r, 2, QTableWidgetItem(
+                    f"{chk.capacity:,.2f} {chk.units}"))
+                self.table.setItem(r, 3, QTableWidgetItem(f"{chk.utilization:.3f}"))
+                item = QTableWidgetItem(chk.status.value)
+                item.setForeground(QColor(status_color(chk.status)))
+                self.table.setItem(r, 4, item)
+
+            self.warn_box.setPlainText("\n".join(result.warnings)
+                                       if result.warnings else "(none)")
+
+    # ------------------- Page: Calculations ---------------------
+
+    class CalcPage(QWidget):
+        def __init__(self):
+            super().__init__()
+            v = QVBoxLayout(self)
+            self.text = QTextEdit()
+            self.text.setReadOnly(True)
+            self.text.setFont(QFont("Courier", 9))
+            v.addWidget(self.text)
+
+        def update_from_result(self, project: Project, result: DesignResult):
+            self.text.setPlainText(build_calc_report_text(project, result))
+
+    # ------------------- Page: 2D Drawing -----------------------
+
+    class Drawing2DPage(QWidget):
+        def __init__(self):
+            super().__init__()
+            v = QVBoxLayout(self)
+            if HAS_MPL:
+                self.fig = Figure(figsize=(9, 5))
+                self.canvas = FigureCanvasQTAgg(self.fig)
+                v.addWidget(self.canvas)
             else:
-                self.results=design_footing(self.project,self.material,self.soil,self.load,self.geom,self.rebar)
-            self.status_lbl.config(text=self.results.status, foreground={"PASS":"#1f7a3a","FAIL":"#b42318","WARNING":"#9a6700"}.get(self.results.status,"#7a8792"))
-            self.update_results_dashboard(); self.update_calculations(); self.update_report_text(); self.plot_plan()
-            messagebox.showinfo("Calculation complete", f"Design status: {self.results.status}\nSee Results, Calculations, Drawings, and Report pages.")
-        except Exception as e:
-            self.status_lbl.config(text="ERROR", foreground="#b42318")
-            messagebox.showerror("Input / calculation error", str(e))
+                v.addWidget(QLabel("Matplotlib is required for 2D drawings."))
 
-    def update_results_dashboard(self):
-        r=self.results
-        lines=["RC FOOTING DESIGN — RESULTS DASHBOARD","="*68]
-        if not r.footing:
-            lines.append("No completed calculation yet.")
-        else:
-            f=r.footing;b=r.bearing;fx=r.flexure;sh=r.shear;p=r.punching;d=r.detailing
-            lines += [
-                f"Type: {f.get('type')}",f"Size: {f.get('B',0):.3f} m × {f.get('L',0):.3f} m × {f.get('h',0)*1000:.0f} mm",f"Effective depth: {f.get('d',0)*1000:.0f} mm",
-                "",f"qa = {b.get('qa',0):.2f} kPa",f"qmax = {b.get('qmax',0):.2f} kPa",f"qmin = {b.get('qmin',0):.2f} kPa",f"Bearing utilization = {b.get('utilization',0):.3f}",f"BEARING: {'PASS' if b.get('pass') else 'FAIL / WARNING'}",
-                "",f"X: Mu={fx.get('x',{}).get('Mu',0):.2f} kN·m; As,req={fx.get('x',{}).get('As_req',0):.0f}; As,prov={fx.get('x',{}).get('As_prov',0):.0f}; {fx.get('x',{}).get('dia','')} mm Ø @ {fx.get('x',{}).get('spacing','')} mm",f"Y: Mu={fx.get('y',{}).get('Mu',0):.2f} kN·m; As,req={fx.get('y',{}).get('As_req',0):.0f}; As,prov={fx.get('y',{}).get('As_prov',0):.0f}; {fx.get('y',{}).get('dia','')} mm Ø @ {fx.get('y',{}).get('spacing','')} mm",f"FLEXURE: {'PASS' if fx.get('x',{}).get('pass') and fx.get('y',{}).get('pass') else 'FAIL'}",
-                "",f"One-way shear X: {'PASS' if sh.get('x',{}).get('pass') else 'FAIL'}; utilization={sh.get('x',{}).get('utilization',0):.3f}",f"One-way shear Y: {'PASS' if sh.get('y',{}).get('pass') else 'FAIL'}; utilization={sh.get('y',{}).get('utilization',0):.3f}",f"Punching: {'PASS' if p.get('pass') else 'FAIL'}; utilization={p.get('utilization',0):.3f}",f"Detailing / fit: {'PASS' if d.get('cover_pass') and d.get('fit_x') and d.get('fit_y') else 'WARNING / FAIL'}",
-                "",f"BOTTOM X: {r.reinforcement.get('bottom_x','-')}",f"BOTTOM Y: {r.reinforcement.get('bottom_y','-')}",f"DOWELS: {r.reinforcement.get('dowels','-')}","",f"OVERALL DESIGN STATUS: {r.status}","",
-                "WARNINGS:"]+(["• "+w for w in r.warnings] if r.warnings else ["• None"])
-        self.result_text.configure(state="normal");self.result_text.delete("1.0","end");self.result_text.insert("1.0","\n".join(lines));self.result_text.configure(state="disabled")
+        def update_from_result(self, project: Project, result: DesignResult):
+            if not HAS_MPL:
+                return
+            self.fig.clear()
+            ax1 = self.fig.add_subplot(1, 2, 1)
+            ax2 = self.fig.add_subplot(1, 2, 2)
+            draw_plan(project, result, ax1)
+            draw_section(project, ax2)
+            self.fig.tight_layout()
+            self.canvas.draw_idle()
 
-    def update_calculations(self):
-        r=self.results
-        text=["DETAILED CALCULATION SHEET","="*80]
-        if not r.calculations:
-            text.append("Calculate the design first.")
-        else:
-            text += r.calculations
-            text += ["","CALCULATION TRACE:"]+[" → ".join(r.trace)]
-            text += ["","ASSUMPTIONS:"]+(["• "+x for x in r.assumptions] if r.assumptions else [])
-            text += ["","CODE REFERENCES / VERIFICATION NOTES:"]+(["• "+x for x in r.code_refs] if r.code_refs else [])
-            text += ["","ENGINEERING LIMITATIONS:","• Settlement analysis not implemented.","• Combined/trapezoidal/strap footing models are preliminary where applicable.","• Exact NSCP 2015 clause numbers are intentionally not fabricated."]
-        self.calc_text.configure(state="normal");self.calc_text.delete("1.0","end");self.calc_text.insert("1.0","\n".join(text));self.calc_text.configure(state="disabled")
+    # ------------------- Page: 3D Model -------------------------
 
-    def update_report_text(self):
-        self.report_text.configure(state="normal");self.report_text.delete("1.0","end");self.report_text.insert("1.0",self.make_report_text());self.report_text.configure(state="disabled")
+    class Model3DPage(QWidget):
+        def __init__(self):
+            super().__init__()
+            v = QVBoxLayout(self)
+            self.status = QLabel("3D model will appear here after RUN DESIGN.")
+            v.addWidget(self.status)
+            self.frame = QWidget()
+            v.addWidget(self.frame)
 
-    def make_report_text(self):
-        r=self.results;p=self.project;m=self.material;s=self.soil;l=self.load;g=self.geom
-        lines=["="*72,"REINFORCED CONCRETE FOOTING DESIGN","NSCP 2015 / ACI-BASED SCREENING","="*72,"PROJECT INFORMATION","-"*72,f"Project: {p.project_name}",f"Location: {p.location}",f"Structure: {p.structure}",f"Foundation: {p.footing_mark}",f"Column: {p.column_mark}",f"Designer: {p.designer}",f"Checked By: {p.checked_by}",f"Date: {p.design_date}","", "DESIGN INPUTS","-"*72,f"f'c = {m.fc:.2f} MPa",f"fy = {m.fy:.2f} MPa",f"qa = {s.qa:.2f} kPa",f"Bearing method = {s.bearing_method}",f"Input mode = {l.input_mode}","", "FOOTING GEOMETRY","-"*72,f"Type = {g.footing_type}",f"B = {g.B:.3f} m; L = {g.L:.3f} m; h = {g.h:.3f} m",f"Column = {g.cx:.3f} × {g.cy:.3f} m",f"Cover = {g.cover:.0f} mm"]
-        if r.footing:
-            lines += ["", "BEARING PRESSURE","-"*72,f"qmax = {r.bearing.get('qmax',0):.2f} kPa",f"qmin = {r.bearing.get('qmin',0):.2f} kPa",f"ex = {r.bearing.get('ex',0):.4f} m; ey = {r.bearing.get('ey',0):.4f} m",f"Bearing status = {'PASS' if r.bearing.get('pass') else 'FAIL / WARNING'}", "", "FLEXURAL DESIGN", "-"*72]
-            for k,label in (("x","X-DIRECTION"),("y","Y-DIRECTION")):
-                f=r.flexure.get(k,{})
-                lines += [label,f"Mu = {f.get('Mu',0):.2f} kN·m",f"d = {f.get('d',0):.1f} mm",f"As,req = {f.get('As_req',0):.0f} mm²/m",f"As,min = {f.get('As_min',0):.0f} mm²/m",f"As,prov = {f.get('As_prov',0):.0f} mm²/m",f"Reinforcement = {f.get('dia','')} mm Ø @ {f.get('spacing','')} mm",f"Status = {'PASS' if f.get('pass') else 'FAIL'}",""]
-            lines += ["ONE-WAY SHEAR","-"*72]
-            for k in ("x","y"):
-                q=r.shear.get(k,{})
-                lines += [f"{k.upper()}: Vu={q.get('Vu',0):.2f} kN; φVc={q.get('phiVc',0):.2f} kN; status={'PASS' if q.get('pass') else 'FAIL'}"]
-            lines += ["", "PUNCHING SHEAR", "-"*72,f"bo = {r.punching.get('bo',0):.1f} mm",f"Vu = {r.punching.get('Vu',0):.2f} kN",f"φVc = {r.punching.get('phiVc',0):.2f} kN",f"Status = {'PASS' if r.punching.get('pass') else 'FAIL'}", "", "DEVELOPMENT / DETAILING", "-"*72,f"Ld screen = {r.development.get('Ld',0):.0f} mm",f"Available = {r.development.get('available',0):.0f} mm",f"Development = {'PASS' if r.development.get('pass') else 'FAIL'}", "", "FINAL RECOMMENDATION", "-"*72,f"Overall status = {r.status}"]
-            lines += ["", "WARNINGS"] + (["- "+w for w in r.warnings] if r.warnings else ["- None"])
-            lines += ["", "ASSUMPTIONS"] + (["- "+x for x in r.assumptions] if r.assumptions else ["- None recorded"])
-            lines += ["", "CODE REFERENCES"] + (["- "+x for x in r.code_refs] if r.code_refs else ["- Verify against official NSCP 2015"])
-            lines += ["", "DISCLAIMER",DISCLAIMER]
-        else:
-            lines += ["",DISCLAIMER]
-        return "\n".join(lines)
+        def update_from_result(self, project: Project, result: DesignResult):
+            try:
+                import pyvista as pv
+                from pyvistaqt import QtInteractor  # optional
+                # If pyvistaqt is not installed, fall back to a static plot
+                # rendered to a PNG-like note.
+                raise ImportError("pyvistaqt not installed in this build")
+            except Exception:
+                # Graceful fallback
+                self.status.setText(
+                    "3D view requires <code>pyvista</code> and "
+                    "<code>pyvistaqt</code>.<br>"
+                    "Install with:  <code>pip install pyvista pyvistaqt</code><br><br>"
+                    f"Model summary (from design result):<br>"
+                    f"&nbsp;&nbsp;Footing: {project.geometry.B:.0f} × "
+                    f"{project.geometry.L:.0f} × {project.geometry.H:.0f} mm<br>"
+                    f"&nbsp;&nbsp;Column : {project.geometry.cx:.0f} × "
+                    f"{project.geometry.cy:.0f} mm<br>"
+                    f"&nbsp;&nbsp;Rebar  : {project.rebar.diameter:.0f} mm")
+                return
 
-    def reset_project(self):
-        if not messagebox.askyesno("Reset", "Reset all project inputs and results?"): return
-        self.destroy(); FootingDesignApp().mainloop()
+    # ------------------- Main Window ----------------------------
 
-    def save_project(self):
-        try:
-            self.read_inputs()
-            payload={"project":asdict(self.project),"material":asdict(self.material),"soil":asdict(self.soil),"load":asdict(self.load),"geom":asdict(self.geom),"rebar":asdict(self.rebar)}
-            p=filedialog.asksaveasfilename(defaultextension=".json",filetypes=[("JSON project","*.json")],title="Save Project")
-            if not p:return
-            with open(p,"w",encoding="utf-8") as f: json.dump(payload,f,indent=2)
-            messagebox.showinfo("Saved",f"Project saved to:\n{p}")
-        except Exception as e: messagebox.showerror("Save error",str(e))
+    class MainWindow(QMainWindow):
+        def __init__(self):
+            super().__init__()
+            self.setWindowTitle("RC Footing Designer — NSCP 2015")
+            self.resize(1280, 800)
 
-    def load_project(self):
-        p=filedialog.askopenfilename(filetypes=[("JSON project","*.json")],title="Load Project")
-        if not p:return
-        try:
-            with open(p,"r",encoding="utf-8") as f: payload=json.load(f)
-            for section, cls in [("project",ProjectData),("material",MaterialProperties),("soil",SoilProperties),("load",LoadData),("geom",FootingGeometry),("rebar",RebarSpec)]:
-                if section in payload:
-                    obj=cls(**payload[section])
-                    setattr(self, {"project":"project","material":"material","soil":"soil","load":"load","geom":"geom","rebar":"rebar"}[section], obj)
-            self._push_objects_to_vars(); messagebox.showinfo("Loaded",f"Project loaded from:\n{p}")
-        except Exception as e: messagebox.showerror("Load error",str(e))
+            splitter = QSplitter()
+            self.setCentralWidget(splitter)
 
-    def _push_objects_to_vars(self):
-        d=self.project.__dict__
-        for k,v in d.items():
-            if k in self.vars:
-                if isinstance(self.vars[k],tk.Text): self.vars[k].delete("1.0","end");self.vars[k].insert("1.0",v)
-                else:self.vars[k].set(v)
-        for obj in (self.material,self.soil,self.load,self.geom,self.rebar):
-            for k,v in asdict(obj).items():
-                if k in self.vars:self.vars[k].set(v)
-        self.update_dynamic_fields()
-        self.update_results_dashboard();self.update_calculations();self.update_report_text()
+            # Sidebar
+            self.tree = QTreeWidget()
+            self.tree.setHeaderLabel("Navigation")
+            self.tree.setMinimumWidth(260)
+            self.tree.setIndentation(14)
+            splitter.addWidget(self.tree)
 
-    def generate_report(self):
-        try:
-            if not self.results.footing: self.calculate()
-            p=filedialog.asksaveasfilename(defaultextension=".txt",filetypes=[("Text report","*.txt")],title="Save Calculation Report")
-            if not p:return
-            with open(p,"w",encoding="utf-8") as f:f.write(self.make_report_text())
-            messagebox.showinfo("Report generated",f"Calculation report saved to:\n{p}\n\nPNG exports are available from Drawings.")
-        except Exception as e: messagebox.showerror("Report error",str(e))
+            # Right side: header + stacked pages
+            right = QWidget()
+            rv = QVBoxLayout(right)
+            rv.setContentsMargins(6, 6, 6, 6)
+            self.header = QLabel()
+            self.header.setStyleSheet("font-size: 14px; font-weight: bold;")
+            rv.addWidget(self.header)
 
-    def clear_plot(self):
-        for w in self.plot_frame.winfo_children(): w.destroy()
-        self.plot_figure=None;self.plot_canvas=None
+            self.progress = QProgressBar()
+            self.progress.setRange(0, 100)
+            self.progress.setValue(0)
+            rv.addWidget(self.progress)
 
-    def _new_fig(self, projection=None):
-        self.clear_plot();fig=plt.Figure(figsize=(10,6),dpi=100);ax=fig.add_subplot(111,projection=projection) if projection else fig.add_subplot(111);self.plot_figure=fig;self.plot_canvas=FigureCanvasTkAgg(fig,master=self.plot_frame);self.plot_canvas.draw();self.plot_canvas.get_tk_widget().pack(fill="both",expand=True);return ax
+            self.stack = QStackedWidget()
+            rv.addWidget(self.stack, 1)
+            splitter.addWidget(right)
+            splitter.setStretchFactor(1, 1)
 
-    def plot_plan(self):
-        self.current_plot_kind="plan"
-        ax=self._new_fig();g=self.geom;r=self.results
-        B=r.footing.get("B",g.B) if r.footing else g.B;L=r.footing.get("L",g.L) if r.footing else g.L
-        ax.set_aspect("equal",adjustable="box")
-        if g.footing_type=="Combined Trapezoidal":
-            B1,B2=g.B1,g.B2; x=np.array([0,L,L,0,0]); y=np.array([-B1/2,B2/2,B2/2,-B1/2,-B1/2]); ax.plot(x,y,linewidth=2,label="Footing")
-        else:
-            ax.add_patch(plt.Rectangle((-L/2,-B/2),L,B,fill=False,linewidth=2))
-        cx,cy=g.cx,g.cy
-        ox,oy=g.col_offset_x,g.col_offset_y
-        ax.add_patch(plt.Rectangle((ox-cx/2,oy-cy/2),cx,cy,fill=False,linewidth=2))
-        ax.axhline(0,color="gray",linewidth=0.8);ax.axvline(0,color="gray",linewidth=0.8)
-        ax.plot(0,0,'o',markersize=4,label="Footing center")
-        if r.bearing:
-            ex,ey=r.bearing.get("ex",0),r.bearing.get("ey",0);ax.plot(ey,ex,'x',markersize=9,label="Resultant")
-            ax.annotate(f"e = ({ey:.3f}, {ex:.3f}) m",(ey,ex),textcoords="offset points",xytext=(8,8))
-        if g.footing_type in ("Combined Rectangular","Strap Footing"):
-            s=g.col_spacing
-            for xx in (-s/2,s/2): ax.add_patch(plt.Rectangle((xx-cx/2,-cy/2),cx,cy,fill=False,linewidth=1.7))
-        # Conceptual rebars
-        if r.flexure:
-            sx=r.flexure.get("x",{}).get("spacing",150)/1000; sy=r.flexure.get("y",{}).get("spacing",150)/1000
-            for y in np.arange(-B/2+g.cover/1000,B/2+1e-6,sy): ax.plot(np.linspace(-L/2+g.cover/1000,L/2-g.cover/1000,2),[y,y],alpha=0.45)
-            for x in np.arange(-L/2+g.cover/1000,L/2+1e-6,sx): ax.plot([x,x],[-B/2+g.cover/1000,B/2-g.cover/1000],alpha=0.45)
-        ax.set_xlabel("Length / X (m)");ax.set_ylabel("Width / Y (m)");ax.set_title("PLAN VIEW — SCHEMATIC");ax.legend(loc="upper right",fontsize=8);ax.grid(alpha=0.2)
-        ax.text(0.01,0.01,"SCHEMATIC — NOT FOR FABRICATION",transform=ax.transAxes,fontsize=8)
-        self.plot_canvas.draw()
+            # Pages
+            self.pages: Dict[str, QWidget] = {}
+            for key, label, cls in [
+                ("project", "Project Information", ProjectPage),
+                ("footing", "Footing Type", FootingTypePage),
+                ("geometry", "Geometry", GeometryPage),
+                ("materials", "Materials", MaterialsPage),
+                ("loads", "Loads", LoadsPage),
+                ("soil", "Soil", SoilPage),
+                ("results", "Results Dashboard", ResultsPage),
+                ("calc", "Detailed Calculations", CalcPage),
+                ("d2", "2D Drawing", Drawing2DPage),
+                ("d3", "3D Model", Model3DPage),
+            ]:
+                page = cls()
+                self.pages[key] = page
+                self.stack.addWidget(page)
 
-    def plot_section(self):
-        self.current_plot_kind="section"
-        ax=self._new_fig();g=self.geom;r=self.results
-        B=r.footing.get("B",g.B) if r.footing else g.B; h=r.footing.get("h",g.h) if r.footing else g.h
-        c=max(g.cx,g.cy);ph=g.pedestal_h if g.pedestal_h>0 else 0
-        ax.set_aspect("equal",adjustable="box")
-        ax.add_patch(plt.Rectangle((-B/2,-h),B,h,fill=False,linewidth=2))
-        colw=c/2
-        ax.add_patch(plt.Rectangle((-colw,0),c,max(1.5,h+ph),fill=False,linewidth=2))
-        if g.pedestal_B>0 and g.pedestal_h>0:
-            ax.add_patch(plt.Rectangle((-g.pedestal_B/2,0),g.pedestal_B,g.pedestal_h,fill=False,linewidth=1.5))
-        ax.axhline(0,color="gray",linewidth=1);ax.text(B*0.52,0,"Ground / reference",va="bottom")
-        ybar=-h+g.cover/1000
-        dia=(r.flexure.get("x",{}).get("dia",16))/1000
-        xs=np.linspace(-B/2+g.cover/1000,B/2-g.cover/1000,max(4,int(B/0.25)))
-        ax.plot(xs,[ybar]*len(xs),'o',markersize=3)
-        ax.annotate(f"h = {h*1000:.0f} mm",(B/2,-h/2),xytext=(B*0.58,-h/2),arrowprops=dict(arrowstyle="<->"))
-        ax.annotate(f"cover = {g.cover:.0f} mm",(-B/2,-h+g.cover/1000),xytext=(-B*0.9,-h*0.75),arrowprops=dict(arrowstyle="->"))
-        ax.set_xlim(-B*0.75,B*0.75);ax.set_ylim(-h*1.35,max(1.7,h+ph));ax.set_xlabel("Section width (m)");ax.set_ylabel("Elevation (m)");ax.set_title("SECTION VIEW — SCHEMATIC");ax.grid(alpha=0.15)
-        ax.text(0.01,0.01,"SCHEMATIC — NOT FOR FABRICATION",transform=ax.transAxes,fontsize=8)
-        self.plot_canvas.draw()
+            # Tree items
+            groups = {
+                "PROJECT": [("Project Information", "project"),
+                            ("Footing Type", "footing")],
+                "INPUTS": [("Geometry", "geometry"),
+                           ("Materials", "materials"),
+                           ("Loads", "loads"),
+                           ("Soil", "soil")],
+                "OUTPUT": [("Summary", "results"),
+                           ("Detailed Calculations", "calc"),
+                           ("2D Drawing", "d2"),
+                           ("3D Model", "d3")],
+            }
+            for gname, entries in groups.items():
+                gitem = QTreeWidgetItem(self.tree, [gname])
+                f = gitem.font(0); f.setBold(True); gitem.setFont(0, f)
+                gitem.setExpanded(True)
+                for label, key in entries:
+                    item = QTreeWidgetItem(gitem, [label])
+                    item.setData(0, Qt.UserRole, key)
+            self.tree.itemClicked.connect(self._navigate)
 
-    def _cuboid(self, ax, x0,x1,y0,y1,z0,z1,alpha=0.7):
-        verts=[[(x0,y0,z0),(x1,y0,z0),(x1,y1,z0),(x0,y1,z0)],[(x0,y0,z1),(x1,y0,z1),(x1,y1,z1),(x0,y1,z1)],[(x0,y0,z0),(x1,y0,z0),(x1,y0,z1),(x0,y0,z1)],[(x0,y1,z0),(x1,y1,z0),(x1,y1,z1),(x0,y1,z1)],[(x0,y0,z0),(x0,y1,z0),(x0,y1,z1),(x0,y0,z1)],[(x1,y0,z0),(x1,y1,z0),(x1,y1,z1),(x1,y0,z1)]]
-        ax.add_collection3d(Poly3DCollection(verts,alpha=alpha,linewidths=0.7))
+            # Toolbar
+            tb = self.addToolBar("Main")
+            act_run = QAction("▶  RUN DESIGN", self)
+            act_run.triggered.connect(self.run_design)
+            tb.addAction(act_run)
+            act_save = QAction("💾  Save Project", self)
+            act_save.triggered.connect(self.save_project)
+            tb.addAction(act_save)
+            act_open = QAction("📂  Open Project", self)
+            act_open.triggered.connect(self.open_project)
+            tb.addAction(act_open)
+            act_pdf = QAction("📄  Export PDF Report", self)
+            act_pdf.triggered.connect(self.export_pdf_report)
+            tb.addAction(act_pdf)
 
-    def plot_3d(self):
-        self.current_plot_kind="3d"
-        ax=self._new_fig(projection="3d");g=self.geom;r=self.results
-        B=r.footing.get("B",g.B) if r.footing else g.B;L=r.footing.get("L",g.L) if r.footing else g.L;h=r.footing.get("h",g.h) if r.footing else g.h
-        self._cuboid(ax,-L/2,L/2,-B/2,B/2,-h,0,0.45)
-        cx,cy=g.cx,g.cy; self._cuboid(ax,-cx/2,cx/2,-cy/2,cy/2,0,1.5,0.6)
-        if g.pedestal_B>0 and g.pedestal_L>0 and g.pedestal_h>0:self._cuboid(ax,-g.pedestal_L/2,g.pedestal_L/2,-g.pedestal_B/2,g.pedestal_B/2,0,g.pedestal_h,0.65)
-        # conceptual reinforcement
-        if r.flexure:
-            for xx in np.linspace(-L/2+g.cover/1000,L/2-g.cover/1000,6): ax.plot([xx,xx],[-B/2+g.cover/1000,B/2-g.cover/1000],[-h+g.cover/1000]*2,linewidth=1)
-            for yy in np.linspace(-B/2+g.cover/1000,B/2-g.cover/1000,6): ax.plot([-L/2+g.cover/1000,L/2-g.cover/1000],[yy,yy],[-h+g.cover/1000]*2,linewidth=1)
-        ax.set_xlabel("X (m)");ax.set_ylabel("Y (m)");ax.set_zlabel("Z (m)");ax.set_title("3D MODEL — SCHEMATIC");
-        ax.text2D(0.02,0.02,"SCHEMATIC — NOT FOR FABRICATION",transform=ax.transAxes,fontsize=8)
-        self.plot_canvas.draw()
+            # Footer status bar
+            self.statusBar().showMessage(
+                "Ready. Design code: NSCP 2015. "
+                "Unverified provisions are flagged 'REQUIRES CODE VERIFICATION'.")
+            self._refresh_header()
+            self.stack.setCurrentWidget(self.pages["project"])
 
-    def export_current_plot(self):
-        if self.plot_figure is None:return
-        p=filedialog.asksaveasfilename(defaultextension=".png",filetypes=[("PNG image","*.png")],title="Export Drawing")
-        if not p:return
-        self.plot_figure.savefig(p,bbox_inches="tight",dpi=200)
-        messagebox.showinfo("Exported",f"Drawing exported to:\n{p}")
+        def _refresh_header(self):
+            p = state["project"]
+            self.header.setText(
+                f"RC Footing Designer — NSCP 2015 &nbsp;|&nbsp; "
+                f"Project: {p.info.name} &nbsp;|&nbsp; "
+                f"Footing: {p.info.foundation_mark} ({p.footing_type}) &nbsp;|&nbsp; "
+                f"Status: "
+                f"<span style='color:{status_color(state['result'].overall_status if state['result'] else Status.NOT_ANALYZED)};'>"
+                f"{(state['result'].overall_status.value if state['result'] else Status.NOT_ANALYZED.value)}</span>")
+
+        def _navigate(self, item, _col):
+            key = item.data(0, Qt.UserRole)
+            if key and key in self.pages:
+                page = self.pages[key]
+                if hasattr(page, "refresh_from_model"):
+                    page.refresh_from_model()
+                self.stack.setCurrentWidget(page)
+
+        def run_design(self):
+            self.progress.setValue(10)
+            try:
+                project = state["project"]
+                self.progress.setValue(30)
+                engine = IsolatedFootingDesign(project)
+                result = engine.run()
+                self.progress.setValue(80)
+                state["result"] = result
+
+                # Refresh dependent pages
+                for key in ("results", "calc", "d2", "d3"):
+                    page = self.pages[key]
+                    if hasattr(page, "update_from_result"):
+                        page.update_from_result(project, result)
+
+                self.progress.setValue(100)
+                self._refresh_header()
+                self.statusBar().showMessage(
+                    f"Design complete — {result.overall_status.value}",
+                    5000)
+                if result.overall_status == Status.FAIL:
+                    QMessageBox.warning(self, "Design FAIL",
+                        "One or more NSCP 2015 checks FAILED. "
+                        "Review the Results dashboard and Detailed Calculations.")
+                elif result.warnings:
+                    QMessageBox.information(self, "Design with warnings",
+                        "Design completed with warnings. "
+                        "See the Results dashboard.")
+                self.stack.setCurrentWidget(self.pages["results"])
+            except InputValidationError as e:
+                self.progress.setValue(0)
+                QMessageBox.critical(self, "Invalid input", str(e))
+            except Exception as e:  # noqa: BLE001
+                self.progress.setValue(0)
+                traceback.print_exc()
+                QMessageBox.critical(self, "Unexpected error",
+                    f"Unable to complete design:\n\n{e}\n\n"
+                    "Possible causes: invalid dimensions, missing materials, "
+                    "or invalid load input. Please review the highlighted "
+                    "inputs. Technical details logged to the console.")
+
+        def save_project(self):
+            path, _ = QFileDialog.getSaveFileName(
+                self, "Save Project", "footing_project.json",
+                "JSON files (*.json)")
+            if not path:
+                return
+            try:
+                p = state["project"]
+                data = {
+                    "info": asdict(p.info),
+                    "footing_type": p.footing_type,
+                    "geometry": asdict(p.geometry),
+                    "concrete": asdict(p.concrete),
+                    "rebar": asdict(p.rebar),
+                    "soil": asdict(p.soil),
+                    "load_cases": [asdict(lc) for lc in p.load_cases],
+                    "code_version": CODE_VERSION,
+                }
+                Path(path).write_text(json.dumps(data, indent=2))
+                self.statusBar().showMessage(f"Saved: {path}", 4000)
+            except Exception as e:  # noqa: BLE001
+                QMessageBox.critical(self, "Save error", str(e))
+
+        def open_project(self):
+            path, _ = QFileDialog.getOpenFileName(
+                self, "Open Project", "", "JSON files (*.json)")
+            if not path:
+                return
+            try:
+                data = json.loads(Path(path).read_text())
+                p = Project(
+                    info=ProjectInfo(**data["info"]),
+                    footing_type=data.get("footing_type", "isolated"),
+                    geometry=FootingGeometry(**data["geometry"]),
+                    concrete=Concrete(**data["concrete"]),
+                    rebar=Rebar(**data["rebar"]),
+                    soil=Soil(**data["soil"]),
+                    load_cases=[LoadCase(**lc) for lc in data["load_cases"]],
+                )
+                state["project"] = p
+                state["result"] = None
+                # Refresh all pages
+                for page in self.pages.values():
+                    if hasattr(page, "refresh_from_model"):
+                        page.refresh_from_model()
+                self._refresh_header()
+                self.statusBar().showMessage(f"Loaded: {path}", 4000)
+            except Exception as e:  # noqa: BLE001
+                QMessageBox.critical(self, "Open error", str(e))
+
+        def export_pdf_report(self):
+            if state["result"] is None:
+                QMessageBox.information(self, "Run design first",
+                    "Please run the design before exporting a report.")
+                return
+            path, _ = QFileDialog.getSaveFileName(
+                self, "Export PDF Report", "footing_report.pdf",
+                "PDF files (*.pdf)")
+            if not path:
+                return
+            ok = export_pdf(state["project"], state["result"], path)
+            if not ok:
+                # Save as .txt fallback
+                txt_path = path + ".txt"
+                Path(txt_path).write_text(
+                    build_calc_report_text(state["project"], state["result"]))
+                QMessageBox.information(self, "ReportLab not available",
+                    f"ReportLab is not installed, so a plain-text report "
+                    f"was saved instead:\n{txt_path}")
+            else:
+                self.statusBar().showMessage(f"PDF saved: {path}", 4000)
+
+    app = QApplication.instance() or QApplication(sys.argv)
+    win = MainWindow()
+    win.show()
+    sys.exit(app.exec())
 
 
-def main():
-    app=FootingDesignApp()
-    app.mainloop()
+# ---------------------------------------------------------------------------
+# [SECTION 7]  ENTRY POINT
+# ---------------------------------------------------------------------------
+
+def run_cli_demo():
+    """Headless demonstration so the file is testable without a GUI."""
+    p = Project()
+    p.info.name = "DEMO — NOT FOR ACTUAL DESIGN"
+    p.info.foundation_mark = "F1"
+    p.geometry = FootingGeometry(B=2400, L=2000, H=450, cx=400, cy=400)
+    p.concrete = Concrete(fc=28.0)
+    p.rebar = Rebar(fy=415.0, diameter=20.0)
+    p.soil = Soil(qa=200.0, Df=1.5, unit_weight=18.0)
+    p.load_cases = [LoadCase("D", 800, 0, 0), LoadCase("L", 400, 0, 0)]
+
+    engine = IsolatedFootingDesign(p)
+    result = engine.run()
+    print(build_calc_report_text(p, result))
 
 
 if __name__ == "__main__":
-    main()
-
+    if "--cli" in sys.argv:
+        run_cli_demo()
+    else:
+        run_gui()

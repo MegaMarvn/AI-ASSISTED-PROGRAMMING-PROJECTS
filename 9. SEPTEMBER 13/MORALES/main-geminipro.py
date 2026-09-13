@@ -52,7 +52,7 @@ class BeamDesignApp:
         # Dictionary to store entry widgets
         self.entries = {}
         
-        # Define Input Fields
+        # Define Input Fields (Now including Beam Span)
         fields = [
             ("Material Properties", None),
             ("Concrete f'c (MPa)", "28"),
@@ -61,6 +61,7 @@ class BeamDesignApp:
             ("Beam Geometry", None),
             ("Width b (mm)", "250"),
             ("Depth h (mm)", "400"),
+            ("Beam Span L (mm)", "4000"),
             ("Clear Cover (mm)", "40"),
             ("Loading / Demands", None),
             ("Factored Moment Support (kN-m)", "150"),
@@ -101,6 +102,7 @@ class BeamDesignApp:
             fyt = float(self.entries["Stirrup fyt (MPa)"].get())
             b = float(self.entries["Width b (mm)"].get())
             h = float(self.entries["Depth h (mm)"].get())
+            L = float(self.entries["Beam Span L (mm)"].get())
             cover = float(self.entries["Clear Cover (mm)"].get())
             Mu_sup = float(self.entries["Factored Moment Support (kN-m)"].get()) * 1e6 # N-mm
             Mu_mid = float(self.entries["Factored Moment Midspan (kN-m)"].get()) * 1e6 # N-mm
@@ -110,7 +112,7 @@ class BeamDesignApp:
             framing = self.seismic_combo.get()
 
             # Input checks
-            if min(fc, fy, fyt, b, h, db, dt) <= 0:
+            if min(fc, fy, fyt, b, h, L, db, dt) <= 0:
                 raise ValueError("Values must be greater than zero.")
 
             # Effective depth (d)
@@ -169,7 +171,7 @@ class BeamDesignApp:
                 'b': b, 'h': h, 'd': d, 'cover': cover, 'db': db, 'dt': dt,
                 'n_top_sup': n_top_sup, 'n_bot_mid': n_bot_mid, 
                 'n_bot_sup': n_bot_sup, 'n_top_mid': n_top_mid,
-                'l_0': l_0, 's1': s1, 's2': s2, 'L': 4000 # Assumed span for rendering
+                'l_0': l_0, 's1': s1, 's2': s2, 'L': L
             }
 
             self.display_results()
@@ -247,7 +249,7 @@ class BeamDesignApp:
         stirrup_x = []
         # Left l_0 zone
         x = 50 # 50mm from face of support
-        while x <= l_0:
+        while x <= l_0 and x < (L/2):
             stirrup_x.append(x)
             x += s1
         # Middle zone
@@ -255,7 +257,7 @@ class BeamDesignApp:
             stirrup_x.append(x)
             x += s2
         # Right l_0 zone
-        x = L - l_0
+        x = max(L - l_0, x)
         while x < L - 50:
             stirrup_x.append(x)
             x += s1
@@ -268,7 +270,7 @@ class BeamDesignApp:
         self.ax_elev.plot([0, L], [bot_y, bot_y], 'g-', lw=2, label='Bot Bars')
 
         self.ax_elev.set_aspect('equal', adjustable='datalim')
-        self.ax_elev.set_title('Elevation View (4m Segment)')
+        self.ax_elev.set_title(f'Elevation View ({L/1000:.1f}m Span)')
         self.ax_elev.set_xlabel('Length (mm)')
         self.ax_elev.set_ylabel('Depth (mm)')
 
@@ -306,10 +308,16 @@ class BeamDesignApp:
         # Draw 3D stirrups
         x = 50
         stirrup_zs = []
-        while x <= l_0: stirrup_zs.append(x); x += s1
-        while x < (L - l_0): stirrup_zs.append(x); x += s2
-        x = L - l_0
-        while x < L - 50: stirrup_zs.append(x); x += s1
+        while x <= l_0 and x < (L/2): 
+            stirrup_zs.append(x)
+            x += s1
+        while x < (L - l_0): 
+            stirrup_zs.append(x)
+            x += s2
+        x = max(L - l_0, x)
+        while x < L - 50: 
+            stirrup_zs.append(x)
+            x += s1
 
         for sz in stirrup_zs:
             xs = [cover, b-cover, b-cover, cover, cover]
@@ -317,11 +325,14 @@ class BeamDesignApp:
             zs = [sz] * 5
             self.ax_3d.plot(xs, zs, ys, color='r', lw=1.5)
 
-        self.ax_3d.set_box_aspect([b/L, 1, h/L]) # Scale aspect ratio
+        # Use an automated aspect ratio limit to prevent extreme distortion on very long beams
+        z_scale = L if L < 5000 else 5000
+        self.ax_3d.set_box_aspect([b/z_scale, 1, h/z_scale]) 
+        
         self.ax_3d.set_xlabel('Width (mm)')
         self.ax_3d.set_ylabel('Length Span (mm)')
         self.ax_3d.set_zlabel('Depth (mm)')
-        self.ax_3d.set_title('3D Rebar Cage Isometric View')
+        self.ax_3d.set_title(f'3D Rebar Cage Isometric View ({L/1000:.1f}m Span)')
 
         self.fig_3d.tight_layout()
         self.canvas_3d.draw()

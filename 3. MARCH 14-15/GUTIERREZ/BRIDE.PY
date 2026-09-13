@@ -13,8 +13,8 @@
 ║   • OpenSTAAD live send with full property/material/support push    ║
 ║                                                                      ║
 ║  Run:    python bridge_modeler.py                                    ║
-║  Needs:  Python 3.8+  (tkinter stdlib — no extra pip needed)        ║
-║  Optional: pip install openstaadpy                                  ║
+║  Needs:  Python 3.8+  (tkinter stdlib — no extra pip needed)         ║
+║  Optional: pip install openstaadpy                                   ║
 ╚══════════════════════════════════════════════════════════════════════╝
 """
 
